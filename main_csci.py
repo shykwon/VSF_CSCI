@@ -20,6 +20,7 @@ from utils.masking import (
     get_curriculum_mask_ratio,
 )
 from utils.metrics import metric
+from utils.eval_metrics import evaluate_spectral_metrics
 from utils.result_tracker import ResultTracker
 
 from models.csci import CSCI
@@ -423,6 +424,7 @@ def main(args, runid):
 
     run_mae_all = []   # [split_runs, seq_out_len]
     run_rmse_all = []
+    run_spectral_all = []  # spectral metrics per split
 
     all_idx_tensor = torch.arange(args.num_nodes).to(device)
 
@@ -443,6 +445,9 @@ def main(args, runid):
         outputs_obs = []      # CSCI → obs vars
         outputs_miss = []     # CSCI → miss vars
         outputs_oracle = []   # Forecaster on full input → obs vars
+        split_V_miss_hat = []  # for spectral metrics
+        split_V_miss_true = []
+        split_sigma = []
 
         for iter, (x, y) in enumerate(dataloader['test_loader'].get_iterator()):
             testx = torch.Tensor(x).to(device).transpose(1, 3)
@@ -450,9 +455,18 @@ def main(args, runid):
 
             with torch.no_grad():
                 # CSCI path
-                fc_input, attn_bias, _, _ = csci_model(
+                fc_input, attn_bias, V_miss_hat, sigma = csci_model(
                     testx_masked, obs_idx, miss_idx, x_full_unmasked=testx
                 )
+
+                # Collect spectral data for metrics
+                if len(miss_idx) > 0:
+                    V_miss_true = torch.fft.rfft(
+                        testx[:, 0, miss_idx, :].transpose(1, 2), dim=1, norm='ortho'
+                    )
+                    split_V_miss_hat.append(V_miss_hat)
+                    split_V_miss_true.append(V_miss_true)
+                    split_sigma.append(sigma)
                 preds_all = forecaster(fc_input, idx=all_idx_tensor, args=args)
                 preds_all = preds_all.transpose(1, 3)[:, 0, :, :]
 
@@ -486,16 +500,40 @@ def main(args, runid):
             m, r = metric(scaler.inverse_transform(yhat_oracle[:, :, h]), realy_obs[:, :, h])
             oracle_mae.append(m); oracle_rmse.append(r)
 
+        # Spectral metrics for this split
+        spectral_metrics = {}
+        if split_V_miss_hat:
+            all_V_hat = torch.cat(split_V_miss_hat, dim=0)
+            all_V_true = torch.cat(split_V_miss_true, dim=0)
+            all_sigma = torch.cat(split_sigma, dim=0)
+            spectral_metrics = evaluate_spectral_metrics(all_V_hat, all_V_true, all_sigma)
+
         run_mae_all.append(obs_mae)
         run_rmse_all.append(obs_rmse)
+        run_spectral_all.append(spectral_metrics)
         tracker.log_eval_split(split_run, obs_mae, obs_rmse,
                                miss_mae=miss_mae, miss_rmse=miss_rmse,
-                               oracle_mae=oracle_mae, oracle_rmse=oracle_rmse)
+                               oracle_mae=oracle_mae, oracle_rmse=oracle_rmse,
+                               spectral_metrics=spectral_metrics)
 
         if split_run % 10 == 0:
+            crps_str = f"  CRPS: {spectral_metrics.get('crps', 0):.4f}" if spectral_metrics else ""
             print(f"  Split {split_run:3d} | "
                   f"obsMAE: {np.mean(obs_mae):.4f}  missMAE: {np.mean(miss_mae):.4f}  "
-                  f"oracleMAE: {np.mean(oracle_mae):.4f} | nodes: {len(idx_current_nodes)}")
+                  f"oracleMAE: {np.mean(oracle_mae):.4f} | nodes: {len(idx_current_nodes)}"
+                  f"{crps_str}")
+
+    # Aggregate spectral metrics
+    if run_spectral_all and run_spectral_all[0]:
+        metric_keys = run_spectral_all[0].keys()
+        avg_spectral = {}
+        for k in metric_keys:
+            vals = [s[k] for s in run_spectral_all if k in s]
+            avg_spectral[k] = {'mean': np.mean(vals), 'std': np.std(vals)}
+        print(f"\n  Spectral Metrics (avg over {len(run_spectral_all)} splits):")
+        for k, v in avg_spectral.items():
+            print(f"    {k}: {v['mean']:.4f} +- {v['std']:.4f}")
+        tracker.spectral_summary = avg_spectral
 
     # Save results
     tracker.save()

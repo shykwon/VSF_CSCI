@@ -27,7 +27,7 @@
 ```
 1. 수치 복원 없음: iFFT 결과를 백본에 넣지 않음
 2. 주파수 임베딩 직접 주입: Spectral Projector → 백본 입력
-3. 불확실성 전파: σ를 백본 어텐션에 반영
+3. 불확실성 전파: σ 기반 입력 게이팅 (confidence gating)
 4. 백본 최소 수정: 입력 레이어만 교체, 내부 구조 유지
 ```
 
@@ -293,7 +293,7 @@ class SpectralProjector(nn.Module):
         """
         return:
           e_miss: [B, T, M, d] 임베딩
-          attn_bias: [B, M] 어텐션 바이어스 (σ 기반)
+          uncertainty_weight: [B, M] 불확실성 가중치 (σ 기반, 입력 게이팅용)
         """
         B, F, M = V_miss.shape
 
@@ -315,11 +315,11 @@ class SpectralProjector(nn.Module):
         e_time = self.freq_to_time(e_freq)    # [B, M, d, T]
         e_miss = e_time.permute(0, 3, 1, 2)  # [B, T, M, d]
 
-        # 어텐션 바이어스: 주파수 평균 σ → [B, M]
-        # 값이 클수록 어텐션에서 덜 주목
-        attn_bias = sigma.mean(dim=1)  # [B, M] 주파수 평균
+        # 불확실성 가중치: 주파수 평균 σ → [B, M]
+        # 값이 클수록 입력 게이팅에서 더 감쇠됨 (confidence = exp(-σ))
+        uncertainty_weight = sigma.mean(dim=1)  # [B, M] 주파수 평균
 
-        return e_miss, attn_bias
+        return e_miss, uncertainty_weight
 ```
 
 ---
@@ -370,7 +370,7 @@ class CSCIInputLayer(nn.Module):
         """
         return:
           h: [B, T, N, d] 전체 임베딩 (관측 + 결측 합쳐진)
-          attn_bias: [N] 어텐션 바이어스
+          uncertainty_weight: [N] 불확실성 가중치 (입력 게이팅용)
         """
         B, T, K = x_obs.shape
         d = self.obs_embedding.out_features
@@ -387,28 +387,33 @@ class CSCIInputLayer(nn.Module):
         h[:, :, obs_idx, :] = e_obs
         h[:, :, miss_idx, :] = e_miss
 
-        # 전체 어텐션 바이어스 (관측=0, 결측=σ)
-        attn_bias = torch.zeros(B, self.N, device=x_obs.device)
-        attn_bias[:, miss_idx] = attn_bias_miss
+        # 불확실성 가중치 (관측=0, 결측=σ) — 입력 게이팅용
+        uncertainty_weight = torch.zeros(B, self.N, device=x_obs.device)
+        uncertainty_weight[:, miss_idx] = uncertainty_weight_miss
 
-        return h, attn_bias
+        return h, uncertainty_weight
 ```
 
-### 어텐션 바이어스 적용 (백본 내부)
+### 불확실성 기반 입력 게이팅 (Confidence Gating)
 
 ```python
-# MTGNN 또는 Transformer의 어텐션 계산 시:
-# 기존: attn_weight = softmax(Q·K^T / sqrt(d))
-# 수정: attn_weight = softmax(Q·K^T / sqrt(d) - attn_bias)
-#                                                    ↑
-#                              σ가 클수록 어텐션 점수 낮아짐
+# MTGNN은 GCN 기반이므로 어텐션 메커니즘이 없음.
+# 대신 σ 기반 입력 게이팅으로 불확실성을 반영:
+#   confidence = exp(-σ_mean)   ← σ=0(관측): 1.0, σ>0(결측): <1.0
+#   fc_input = fc_input * confidence
+#
+# 효과: 불확실성 높은 결측 변수의 임베딩을 감쇠시켜
+#       백본이 신뢰도 낮은 입력에 덜 의존하게 함.
+#
+# 참고: Transformer 계열 백본 확장 시 어텐션 바이어스로 전환 가능
 
-def modified_attention(Q, K, V, attn_bias=None):
-    scores = torch.bmm(Q, K.transpose(-2, -1)) / (Q.size(-1) ** 0.5)
-    if attn_bias is not None:
-        scores = scores - attn_bias.unsqueeze(1)  # 브로드캐스트
-    weights = torch.softmax(scores, dim=-1)
-    return torch.bmm(weights, V)
+def confidence_gating(fc_input, attn_bias):
+    """
+    fc_input: [B, d_model, N, T]
+    attn_bias: [B, N] — 0 for observed, σ_mean for missing
+    """
+    confidence = torch.exp(-attn_bias).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+    return fc_input * confidence
 ```
 
 ---
@@ -487,8 +492,8 @@ class CSCILoss(nn.Module):
         self.gamma = gamma  # 불확실성 보정 손실 가중치
 
     def forecast_loss(self, y_pred, y_true):
-        """MSE 예측 손실"""
-        return nn.MSELoss()(y_pred, y_true)
+        """MAE 예측 손실 (VIDA 비교 공정성을 위해 MAE 사용)"""
+        return nn.L1Loss()(y_pred, y_true)
 
     def spectral_alignment_loss(self, V_miss_hat, V_miss_true):
         """
@@ -569,12 +574,13 @@ class CSCI(nn.Module):
         # V_miss_hat: [B, F, M], sigma: [B, F, M]
 
         # Step 3: Spectral Projector → 임베딩 통합
-        h, attn_bias = self.input_layer(
+        h, uncertainty_weight = self.input_layer(
             x_obs, V_miss_hat, sigma, obs_idx, miss_idx
         )  # h: [B, T, N, d]
 
-        # Step 4: 백본 예측
-        y_pred = self.backbone(h, attn_bias)  # [B, H, N]
+        # Step 4: 입력 게이팅 + 백본 예측
+        h = confidence_gating(h, uncertainty_weight)
+        y_pred = self.backbone(h)  # [B, H, N]
 
         return y_pred, V_miss_hat, sigma
 ```

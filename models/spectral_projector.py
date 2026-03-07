@@ -64,7 +64,7 @@ class SpectralProjector(nn.Module):
             miss_idx: [M] int tensor
         Returns:
             h: [B, T, N, d] unified embedding
-            attn_bias: [B, N] attention bias (0 for obs, σ-based for miss)
+            attn_bias: [B, N] uncertainty weight for confidence gating (0 for obs, σ-based for miss)
         """
         B, T, K = x_obs.shape
         M = miss_idx.shape[0]
@@ -91,7 +91,7 @@ class SpectralProjector(nn.Module):
         h[:, :, obs_idx.cpu(), :] = e_obs
         h[:, :, miss_idx.cpu(), :] = e_miss
 
-        # --- Attention bias ---
+        # --- Uncertainty weight for confidence gating ---
         attn_bias = torch.zeros(B, self.N, device=x_obs.device)
         attn_bias[:, miss_idx.cpu()] = sigma.mean(dim=1)  # [B, M] freq-averaged σ
 

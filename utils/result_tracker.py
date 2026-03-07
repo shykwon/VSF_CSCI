@@ -61,7 +61,8 @@ class ResultTracker:
 
     def log_eval_split(self, split_id, mae_list, rmse_list,
                        miss_mae=None, miss_rmse=None,
-                       oracle_mae=None, oracle_rmse=None):
+                       oracle_mae=None, oracle_rmse=None,
+                       spectral_metrics=None):
         """
         Log evaluation results for one random split.
 
@@ -83,6 +84,8 @@ class ResultTracker:
         if oracle_mae is not None:
             entry["oracle_mae_per_horizon"] = [float(v) for v in oracle_mae]
             entry["oracle_rmse_per_horizon"] = [float(v) for v in oracle_rmse]
+        if spectral_metrics:
+            entry["spectral"] = {k: float(v) for k, v in spectral_metrics.items()}
         self.data["eval_splits"].append(entry)
 
     def save(self):
@@ -154,6 +157,14 @@ class ResultTracker:
         if summary is None:
             print("No eval splits to summarize.")
             return
+
+        # Add spectral metrics summary if available
+        if hasattr(self, 'spectral_summary'):
+            summary["spectral_metrics"] = {
+                k: {sk: float(sv) for sk, sv in v.items()}
+                for k, v in self.spectral_summary.items()
+            }
+
         path = os.path.join(self.summary_dir, f"{self.exp_name}_summary.json")
         with open(path, 'w') as f:
             json.dump(summary, f, indent=2)

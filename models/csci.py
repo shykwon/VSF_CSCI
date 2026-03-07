@@ -87,7 +87,7 @@ class CSCI(nn.Module):
             fc_input: [B, C, N, T] — forecaster-ready input
                       embedding mode: C = d_model (+ n_extra)
                       timeseries mode: C = 1 (+ n_extra)
-            attn_bias: [B, N] — attention bias (σ-based, embedding mode only)
+            attn_bias: [B, N] — uncertainty weight for confidence gating (σ-based, embedding mode only)
             V_miss_hat: [B, F, M] — estimated missing spectra (for loss)
             sigma: [B, F, M] — uncertainty (for loss)
         """
@@ -119,9 +119,9 @@ class CSCI(nn.Module):
             )  # h: [B, T, N, d_model]
             fc_input = self.forecast_head(h=h)  # [B, d_model, N, T]
 
-            # σ-based confidence gating: high uncertainty → attenuated input
+            # Uncertainty-based input gating (confidence gating):
             # attn_bias [B, N]: 0 for observed, σ_mean for missing
-            # exp(-x): x=0 → 1.0 (observed preserved), x>0 → <1.0 (missing attenuated)
+            # confidence = exp(-σ): σ=0 → 1.0 (observed preserved), σ>0 → <1.0 (missing attenuated)
             confidence = torch.exp(-attn_bias).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
             fc_input = fc_input * confidence
 
