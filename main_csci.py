@@ -79,6 +79,8 @@ def build_args():
     parser.add_argument('--head_mode', type=str, default='embedding',
                         choices=['embedding', 'timeseries'],
                         help="'embedding': CSCI path (no iFFT), 'timeseries': ablation (iFFT, VIDA-style)")
+    parser.add_argument('--s_rank', type=int, default=16, help='Low-rank S matrix rank')
+    parser.add_argument('--s_epochs', type=int, default=20, help='Stage 1.5: S-only training epochs')
     parser.add_argument('--n_rounds', type=int, default=1,
                         help='Hierarchical propagation rounds (1=disabled, 2=default for 85%%)')
     parser.add_argument('--coherence_threshold', type=float, default=0.3,
@@ -236,11 +238,52 @@ def main(args, runid):
     print("  Forecaster loaded (best val loss).\n")
 
     # ══════════════════════════════════════════════════
-    #  Stage 2: CSCI Training (Forecaster input layer replaced)
+    #  Stage 1.5: S-only Training (spectral loss only)
     # ══════════════════════════════════════════════════
 
-    # Initialize S matrix from training data (instead of Identity)
+    # Initialize S matrix from training data via eigendecomposition
     init_S_from_data(csci_model, dataloader, device, n_batches=50)
+
+    # S-only optimizer (only cs_estimator parameters)
+    engine.s_optimizer = torch.optim.Adam(
+        csci_model.cs_estimator.parameters(),
+        lr=args.learning_rate * 10,  # faster lr for S convergence
+        weight_decay=args.weight_decay,
+    )
+
+    if args.s_epochs > 0:
+        print("=" * 50)
+        print("  Stage 1.5: S-only Training (L_spectral)")
+        print("=" * 50)
+
+        for epoch in range(1, args.s_epochs + 1):
+            train_loss = []
+            t1 = time.time()
+            dataloader['train_loader'].shuffle()
+
+            for iter, (x, y) in enumerate(dataloader['train_loader'].get_iterator()):
+                trainx = torch.Tensor(x).to(device).transpose(1, 3)
+                loss = engine.train_S_only(args, trainx)
+                train_loss.append(loss)
+
+            # Validation
+            val_loss = []
+            for iter, (x, y) in enumerate(dataloader['val_loader'].get_iterator()):
+                testx = torch.Tensor(x).to(device).transpose(1, 3)
+                loss = engine.eval_S_only(args, testx)
+                val_loss.append(loss)
+
+            t2 = time.time()
+            print(f"  Epoch {epoch:03d} | Train: {np.mean(train_loss):.4f} | "
+                  f"Val: {np.mean(val_loss):.4f} | Time: {t2-t1:.1f}s")
+
+        # Re-enable all CSCI params
+        for p in csci_model.parameters():
+            p.requires_grad = True
+
+    # ══════════════════════════════════════════════════
+    #  Stage 2: CSCI Training (Forecaster input layer replaced)
+    # ══════════════════════════════════════════════════
 
     # Replace backbone input layers to accept d_model-dim embedding
     csci_in_dim = csci_model.get_csci_in_dim()

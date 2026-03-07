@@ -35,7 +35,8 @@ class CSCI(nn.Module):
         F = T // 2 + 1
         d_model = args.d_model
         in_dim = args.in_dim
-        lambda_reg = getattr(args, 'lambda_reg', 1e-3)
+        lambda_reg = getattr(args, 'lambda_reg', 0.1)
+        s_rank = getattr(args, 's_rank', 16)
         head_mode = getattr(args, 'head_mode', 'embedding')
         self.n_rounds = getattr(args, 'n_rounds', 1)
         self.coherence_threshold = getattr(args, 'coherence_threshold', 0.3)
@@ -53,7 +54,7 @@ class CSCI(nn.Module):
         self.spectral_encoder = SpectralEncoder(T)
 
         # Module 2: Cross-Spectral Estimator
-        self.cs_estimator = CrossSpectralEstimator(N, F, lambda_reg)
+        self.cs_estimator = CrossSpectralEstimator(N, F, lambda_reg, rank=s_rank)
 
         # Module 3: Spectral Projector (always built, used in embedding mode)
         self.spectral_projector = SpectralProjector(N, F, T, d_model)

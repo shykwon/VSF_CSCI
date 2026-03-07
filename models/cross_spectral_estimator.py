@@ -1,48 +1,48 @@
-# Module 2: Cross-Spectral Estimator
+# Module 2: Cross-Spectral Estimator (Low-rank S)
 # Reference: docs/project_develop_plan.md Section 3
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as nnF
 
 
 class CrossSpectralEstimator(nn.Module):
     """
     Estimate missing variable frequency representations via Wiener filter
-    using a learnable cross-spectral density matrix S.
+    using a learnable low-rank cross-spectral density matrix S.
+
+    S(f) = U(f) · U(f)^H + diag(d(f))
+      - U: [F, N, r] — r共通 spectral patterns (complex)
+      - d: [F, N] — per-variable residual variance (positive via softplus)
+      - Hermitian PSD guaranteed by construction
 
     Key equations:
         V_miss(f) = S_mo(f) · [S_oo(f) + λI]^(-1) · V_obs(f)
         σ_miss(f) = diag(S_mm) - diag(S_mo · S_oo^(-1) · S_om)
-
-    Input:
-        V_obs: [B, F, K] complex — observed variable spectra
-        obs_idx: list[int] — observed variable indices
-        miss_idx: list[int] — missing variable indices
-    Output:
-        V_miss_hat: [B, F, M] complex — estimated missing spectra
-        sigma: [B, F, M] real — estimation uncertainty
     """
 
-    def __init__(self, N: int, F: int, lambda_reg: float = 1e-3):
+    def __init__(self, N: int, F: int, lambda_reg: float = 0.1, rank: int = 16):
         super().__init__()
         self.N = N
         self.F = F
         self.lambda_reg = lambda_reg
+        self.rank = rank
 
-        # Learnable cross-spectral matrix (real + imaginary parts)
-        # Initialized: S_real = I (identity), S_imag = 0
-        self.S_real = nn.Parameter(torch.eye(N).unsqueeze(0).repeat(F, 1, 1))  # [F, N, N]
-        self.S_imag = nn.Parameter(torch.zeros(F, N, N))  # [F, N, N]
+        # Low-rank factors: S = U · U^H + diag(softplus(log_diag))
+        self.U_real = nn.Parameter(torch.randn(F, N, rank) * 0.01)
+        self.U_imag = nn.Parameter(torch.zeros(F, N, rank))
+        self.log_diag = nn.Parameter(torch.zeros(F, N))
 
     def get_S(self) -> torch.Tensor:
         """
-        Construct Hermitian-symmetric cross-spectral matrix.
-        Hermitian: S_ij = conj(S_ji)
+        Construct Hermitian PSD cross-spectral matrix from low-rank factors.
+        S(f) = U(f) · U(f)^H + diag(d(f))
         """
-        S_real_sym = (self.S_real + self.S_real.transpose(-1, -2)) / 2
-        S_imag_antisym = (self.S_imag - self.S_imag.transpose(-1, -2)) / 2
-        S = torch.complex(S_real_sym, S_imag_antisym)  # [F, N, N]
-        return S
+        U = torch.complex(self.U_real, self.U_imag)  # [F, N, r]
+        S_lr = torch.bmm(U, U.conj().transpose(-1, -2))  # [F, N, N] Hermitian
+        d = nnF.softplus(self.log_diag)  # [F, N] positive
+        S_diag = torch.diag_embed(d.to(S_lr.dtype))  # [F, N, N]
+        return S_lr + S_diag
 
     def forward(
         self,
@@ -76,7 +76,6 @@ class CrossSpectralEstimator(nn.Module):
         W = torch.bmm(S_mo, S_oo_inv)  # [F, M, K]
 
         # Estimate missing spectra: V_miss = W · V_obs
-        # V_obs [B, F, K] → need batch-freq matmul
         W_expand = W.unsqueeze(0).expand(B, -1, -1, -1)  # [B, F, M, K]
         V_obs_expand = V_obs.unsqueeze(-1)  # [B, F, K, 1]
         V_miss_hat = torch.matmul(
@@ -104,41 +103,23 @@ class CrossSpectralEstimator(nn.Module):
     def compute_coherence(self, S, obs_idx, miss_idx):
         """
         Compute spectral coherence between observed and missing variables.
-
-        Coherence(f) = |S_mo(f)|^2 / (diag(S_mm(f)) * diag(S_oo(f)))
-        Averaged over observed variables for each missing variable.
-
-        Returns:
-            coherence: [F, M] real in [0, 1]
+        Returns: coherence: [F, M] real in [0, 1]
         """
-        S_oo = S[:, obs_idx][:, :, obs_idx]    # [F, K, K]
-        S_mo = S[:, miss_idx][:, :, obs_idx]   # [F, M, K]
-        S_mm = S[:, miss_idx][:, :, miss_idx]  # [F, M, M]
+        S_oo = S[:, obs_idx][:, :, obs_idx]
+        S_mo = S[:, miss_idx][:, :, obs_idx]
+        S_mm = S[:, miss_idx][:, :, miss_idx]
 
-        # |S_mo|^2 summed over observed vars → [F, M]
         cross_power = (S_mo.abs() ** 2).sum(dim=-1)  # [F, M]
-
-        # Normalization: diag(S_mm) * sum(diag(S_oo))
         diag_mm = torch.diagonal(S_mm, dim1=-2, dim2=-1).real  # [F, M]
-        diag_oo_sum = torch.diagonal(S_oo, dim1=-2, dim2=-1).real.sum(dim=-1, keepdim=True)  # [F, 1]
+        diag_oo_sum = torch.diagonal(S_oo, dim1=-2, dim2=-1).real.sum(dim=-1, keepdim=True)
 
         denom = diag_mm * diag_oo_sum + 1e-8
-        coherence = cross_power / denom  # [F, M]
+        coherence = cross_power / denom
         coherence = torch.clamp(coherence, 0, 1)
         return coherence
 
     def wiener_filter(self, V_obs, obs_idx, miss_idx):
-        """
-        Single-round Wiener filter (reusable for hierarchical propagation).
-
-        Args:
-            V_obs: [B, F, K] complex
-            obs_idx: list/tensor of observed indices
-            miss_idx: list/tensor of missing indices
-        Returns:
-            V_miss_hat: [B, F, M] complex
-            sigma: [B, F, M] real
-        """
+        """Single-round Wiener filter (reusable for hierarchical propagation)."""
         B, F, K = V_obs.shape
         S = self.get_S()
 
@@ -186,24 +167,7 @@ class CrossSpectralEstimator(nn.Module):
         base_threshold: float = 0.3,
         threshold_decay: float = 0.1,
     ) -> tuple:
-        """
-        Hierarchical propagation: multi-round Wiener filter.
-
-        Round 1: Observed → high-coherence missing variables
-        Round 2: Observed + Round1 restored → remaining missing variables
-        ...
-
-        Args:
-            V_obs: [B, F, K] complex
-            obs_idx: [K] int tensor
-            miss_idx: [M] int tensor
-            n_rounds: number of propagation rounds
-            base_threshold: initial coherence threshold
-            threshold_decay: threshold reduction per round
-        Returns:
-            V_miss_hat: [B, F, M] complex — all missing variables estimated
-            sigma: [B, F, M] real — uncertainty for all missing variables
-        """
+        """Hierarchical propagation: multi-round Wiener filter."""
         B, F, _ = V_obs.shape
         S = self.get_S()
         device = V_obs.device
@@ -212,7 +176,6 @@ class CrossSpectralEstimator(nn.Module):
         current_obs_idx = obs_idx.cpu().tolist()
         remaining_miss = miss_idx.cpu().tolist()
 
-        # Track results for all missing variables (in original miss_idx order)
         miss_idx_list = miss_idx.cpu().tolist()
         M = len(miss_idx_list)
         all_V_miss = torch.zeros(B, F, M, dtype=V_obs.dtype, device=device)
@@ -222,37 +185,30 @@ class CrossSpectralEstimator(nn.Module):
             if not remaining_miss:
                 break
 
-            # Compute coherence between current observed and remaining missing
             obs_t = torch.tensor(current_obs_idx, device=device)
             rem_t = torch.tensor(remaining_miss, device=device)
-            coherence = self.compute_coherence(S, obs_t, rem_t)  # [F, len(remaining)]
+            coherence = self.compute_coherence(S, obs_t, rem_t)
 
-            # Select high-coherence variables
             threshold = base_threshold - round_i * threshold_decay
-            mean_coh = coherence.mean(dim=0)  # [len(remaining)]
+            mean_coh = coherence.mean(dim=0)
             high_coh_mask = mean_coh > threshold
 
             if round_i == n_rounds - 1:
-                # Last round: restore all remaining regardless of threshold
                 high_coh_mask = torch.ones_like(high_coh_mask, dtype=torch.bool)
 
             if not high_coh_mask.any():
                 continue
 
-            # Get indices of easy-to-restore variables
             easy_local = high_coh_mask.nonzero(as_tuple=True)[0].cpu().tolist()
             easy_miss = [remaining_miss[i] for i in easy_local]
 
-            # Wiener filter for easy variables
             V_easy, sigma_easy = self.wiener_filter(current_obs, current_obs_idx, easy_miss)
 
-            # Store results in correct positions
             for local_i, global_i in enumerate(easy_miss):
                 orig_pos = miss_idx_list.index(global_i)
                 all_V_miss[:, :, orig_pos] = V_easy[:, :, local_i]
                 all_sigma[:, :, orig_pos] = sigma_easy[:, :, local_i]
 
-            # Add restored variables to observation pool
             current_obs = torch.cat([current_obs, V_easy], dim=-1)
             current_obs_idx.extend(easy_miss)
             remaining_miss = [i for i in remaining_miss if i not in easy_miss]

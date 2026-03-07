@@ -94,6 +94,77 @@ class CSCITrainer:
             rmse = masked_rmse(predict, real, 0.0)[0].item()
         return loss.item(), rmse
 
+    # ─── Stage 1.5: S-only Training (L_spectral only) ───
+
+    def train_S_only(self, args, input):
+        """
+        Train only the CrossSpectralEstimator (S matrix) using L_spectral.
+        No forecaster forward pass needed — only FFT → Wiener → spectral loss.
+        Uses all nodes as observed with random masking for each batch.
+
+        Args:
+            input: [B, in_dim, N, T] full (unmasked) input
+        Returns:
+            spectral_loss: scalar
+        """
+        # Freeze everything except cs_estimator
+        for p in self.csci.parameters():
+            p.requires_grad = False
+        for p in self.csci.cs_estimator.parameters():
+            p.requires_grad = True
+
+        self.csci.cs_estimator.train()
+        self.s_optimizer.zero_grad()
+
+        B, _, N, T = input.shape
+        x_signal = input[:, 0, :, :]  # [B, N, T]
+
+        # Random masking: select ~50% as observed
+        n_obs = max(N // 2, 1)
+        perm = torch.randperm(N, device=input.device)
+        obs_idx = perm[:n_obs].sort().values
+        miss_idx = perm[n_obs:].sort().values
+
+        # FFT on all variables
+        V_all = torch.fft.rfft(x_signal, dim=-1, norm='ortho').permute(0, 2, 1)  # [B, F, N]
+        V_obs = V_all[:, :, obs_idx]   # [B, F, K]
+        V_miss_true = V_all[:, :, miss_idx]  # [B, F, M]
+
+        # Wiener filter estimation
+        V_miss_hat, sigma = self.csci.cs_estimator(V_obs, obs_idx, miss_idx)
+
+        # Spectral alignment loss only
+        loss = self.criterion.spectral_alignment_loss(V_miss_hat, V_miss_true)
+
+        loss.backward()
+        if self.clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.csci.cs_estimator.parameters(), self.clip)
+        self.s_optimizer.step()
+
+        return loss.item()
+
+    def eval_S_only(self, args, input):
+        """Evaluate S-only spectral loss (no grad)."""
+        self.csci.cs_estimator.eval()
+
+        with torch.no_grad():
+            B, _, N, T = input.shape
+            x_signal = input[:, 0, :, :]
+
+            n_obs = max(N // 2, 1)
+            perm = torch.randperm(N, device=input.device)
+            obs_idx = perm[:n_obs].sort().values
+            miss_idx = perm[n_obs:].sort().values
+
+            V_all = torch.fft.rfft(x_signal, dim=-1, norm='ortho').permute(0, 2, 1)
+            V_obs = V_all[:, :, obs_idx]
+            V_miss_true = V_all[:, :, miss_idx]
+
+            V_miss_hat, sigma = self.csci.cs_estimator(V_obs, obs_idx, miss_idx)
+            loss = self.criterion.spectral_alignment_loss(V_miss_hat, V_miss_true)
+
+        return loss.item()
+
     # ─── Stage 2: CSCI Training (Forecaster Frozen) ───
 
     def train_csci(self, args, input, real_val, obs_idx, miss_idx, input_unmasked=None):

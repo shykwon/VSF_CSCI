@@ -1,12 +1,14 @@
 #!/bin/bash
-# Full experiment — S init from data + lambda_reg=0.1 + V_miss_hat clamp
-# fc_epochs=100, csci_epochs=100, 100 splits, 1 run
+# Full experiment — Low-rank S + Stage 1.5 + data init
+# fc_epochs=100, csci_epochs=100, s_epochs=20, 100 splits, 1 run
 
 PYTHON=/home/sheda7788/.conda/envs/tslib_env/bin/python
-EXPID=6
+EXPID=7
 SEED=3407
 FC_EP=100
 CSCI_EP=100
+S_EP=20
+S_RANK=16
 SPLITS=100
 LAMBDA=0.1
 
@@ -14,7 +16,7 @@ cd /home/sheda7788/project/VSF_CSCI
 mkdir -p logs/train logs/eval
 
 echo "=== Full Experiment (ExpID=$EXPID) ==="
-echo "fc_epochs=$FC_EP | csci_epochs=$CSCI_EP | splits=$SPLITS | lambda_reg=$LAMBDA"
+echo "fc=$FC_EP | s=$S_EP | csci=$CSCI_EP | rank=$S_RANK | lambda=$LAMBDA | splits=$SPLITS"
 echo "Start: $(date)"
 echo ""
 
@@ -26,11 +28,11 @@ nohup $PYTHON -u main_csci.py \
     --device cuda:0 \
     --seed $SEED --expid $EXPID \
     --model_name mtgnn --in_dim 2 --d_model 64 \
-    --fc_epochs $FC_EP --csci_epochs $CSCI_EP \
+    --fc_epochs $FC_EP --s_epochs $S_EP --csci_epochs $CSCI_EP \
+    --s_rank $S_RANK --lambda_reg $LAMBDA \
     --batch_size 64 --runs 1 \
     --random_node_idx_split_runs $SPLITS \
     --step_size1 2500 --patience 20 \
-    --lambda_reg $LAMBDA \
     --n_rounds 2 --use_curriculum True \
     --print_every 50 \
     > logs/train/full_METR-LA.log 2>&1 &
@@ -43,11 +45,11 @@ nohup $PYTHON -u main_csci.py \
     --device cuda:1 \
     --seed $SEED --expid $EXPID \
     --model_name mtgnn --in_dim 1 --d_model 64 \
-    --fc_epochs $FC_EP --csci_epochs $CSCI_EP \
+    --fc_epochs $FC_EP --s_epochs $S_EP --csci_epochs $CSCI_EP \
+    --s_rank $S_RANK --lambda_reg $LAMBDA \
     --batch_size 64 --runs 1 \
     --random_node_idx_split_runs $SPLITS \
     --step_size1 2500 --patience 20 \
-    --lambda_reg $LAMBDA \
     --n_rounds 2 --use_curriculum True \
     --print_every 50 \
     > logs/train/full_SOLAR.log 2>&1 &
@@ -61,11 +63,11 @@ nohup bash -c "
         --device cuda:2 \
         --seed $SEED --expid $EXPID \
         --model_name mtgnn --in_dim 1 --d_model 64 \
-        --fc_epochs $FC_EP --csci_epochs $CSCI_EP \
+        --fc_epochs $FC_EP --s_epochs $S_EP --csci_epochs $CSCI_EP \
+        --s_rank $S_RANK --lambda_reg $LAMBDA \
         --batch_size 64 --runs 1 \
         --random_node_idx_split_runs $SPLITS \
         --step_size1 400 --patience 20 \
-        --lambda_reg $LAMBDA \
         --n_rounds 2 --use_curriculum True \
         --print_every 50 \
     && echo '--- ECG done, starting TRAFFIC ---' && \
@@ -74,11 +76,11 @@ nohup bash -c "
         --device cuda:2 \
         --seed $SEED --expid $EXPID \
         --model_name mtgnn --in_dim 1 --d_model 64 \
-        --fc_epochs $FC_EP --csci_epochs $CSCI_EP \
+        --fc_epochs $FC_EP --s_epochs $S_EP --csci_epochs $CSCI_EP \
+        --s_rank $S_RANK --lambda_reg $LAMBDA \
         --batch_size 32 --runs 1 \
         --random_node_idx_split_runs $SPLITS \
         --step_size1 1000 --patience 20 \
-        --lambda_reg $LAMBDA \
         --n_rounds 2 --use_curriculum True \
         --print_every 50
 " > logs/train/full_ECG_TRAFFIC.log 2>&1 &
