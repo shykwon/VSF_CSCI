@@ -84,10 +84,11 @@ class CrossSpectralEstimator(nn.Module):
             V_obs_expand.reshape(B * F, K, 1)
         ).reshape(B, F, M)  # [B, F, M]
 
-        # Clamp V_miss_hat to prevent amplitude explosion
-        # Scale should not exceed observed signal scale
+        # Clamp V_miss_hat amplitude to prevent explosion (preserve phase)
         obs_scale = V_obs.abs().max().clamp(min=1.0)
-        V_miss_hat = V_miss_hat.clamp(-obs_scale * 10, obs_scale * 10)
+        max_amp = obs_scale * 10
+        scale = V_miss_hat.abs() / (max_amp + 1e-8)
+        V_miss_hat = V_miss_hat / scale.clamp(min=1.0)
 
         # Uncertainty: σ = diag(S_mm) - diag(W · S_om)
         S_om = S_mo.conj().transpose(-1, -2)  # [F, K, M]
@@ -160,9 +161,11 @@ class CrossSpectralEstimator(nn.Module):
             V_obs_expand.reshape(B * F, K, 1)
         ).reshape(B, F, M)
 
-        # Clamp V_miss_hat to prevent amplitude explosion
+        # Clamp V_miss_hat amplitude to prevent explosion (preserve phase)
         obs_scale = V_obs.abs().max().clamp(min=1.0)
-        V_miss_hat = V_miss_hat.clamp(-obs_scale * 10, obs_scale * 10)
+        max_amp = obs_scale * 10
+        scale = V_miss_hat.abs() / (max_amp + 1e-8)
+        V_miss_hat = V_miss_hat / scale.clamp(min=1.0)
 
         S_om = S_mo.conj().transpose(-1, -2)
         WS_om = torch.bmm(W, S_om)
