@@ -26,6 +26,7 @@ from utils.result_tracker import ResultTracker
 from models.csci import CSCI
 from forecasters.net import gtnet
 from trainer import CSCITrainer
+from utils.s_init import init_S_from_data
 
 
 def str_to_bool(value):
@@ -74,7 +75,7 @@ def build_args():
 
     # ── Model: CSCI ──
     parser.add_argument('--d_model', type=int, default=64, help='CSCI embedding dimension')
-    parser.add_argument('--lambda_reg', type=float, default=1e-3, help='Wiener filter regularization')
+    parser.add_argument('--lambda_reg', type=float, default=0.1, help='Wiener filter regularization')
     parser.add_argument('--head_mode', type=str, default='embedding',
                         choices=['embedding', 'timeseries'],
                         help="'embedding': CSCI path (no iFFT), 'timeseries': ablation (iFFT, VIDA-style)")
@@ -237,6 +238,9 @@ def main(args, runid):
     # ══════════════════════════════════════════════════
     #  Stage 2: CSCI Training (Forecaster input layer replaced)
     # ══════════════════════════════════════════════════
+
+    # Initialize S matrix from training data (instead of Identity)
+    init_S_from_data(csci_model, dataloader, device, n_batches=50)
 
     # Replace backbone input layers to accept d_model-dim embedding
     csci_in_dim = csci_model.get_csci_in_dim()
