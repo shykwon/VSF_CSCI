@@ -123,7 +123,7 @@ class CSCITrainer:
         fc_input, attn_bias, V_miss_hat, sigma = self.csci(
             input, obs_idx, miss_idx, x_full_unmasked=input_unmasked
         )
-        # fc_input: [B, in_dim, N, T] — already adapted by ForecastHead
+        # fc_input: [B, csci_in_dim, N, T] — d_model(+extra) channels
 
         # Forecaster prediction
         output = self.forecaster(fc_input, idx=torch.arange(args.num_nodes).to(self.device), args=args)

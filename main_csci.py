@@ -396,6 +396,25 @@ def main(args, runid):
     print("  Inference (100 random splits)")
     print("=" * 50)
 
+    # Build separate oracle forecaster with original Stage 1 weights
+    # (current forecaster has replaced input layers for d_model channels)
+    oracle_forecaster = gtnet(
+        args.gcn_true, args.buildA_true, args.gcn_depth, args.num_nodes,
+        device, predefined_A=predefined_A,
+        dropout=args.dropout, subgraph_size=args.subgraph_size,
+        node_dim=args.node_dim, dilation_exponential=args.dilation_exponential,
+        conv_channels=args.conv_channels, residual_channels=args.residual_channels,
+        skip_channels=args.skip_channels, end_channels=args.end_channels,
+        seq_length=args.seq_in_len, in_dim=args.in_dim, out_dim=args.seq_out_len,
+        layers=args.layers, propalpha=args.propalpha, tanhalpha=args.tanhalpha,
+        layer_norm_affline=True,
+    ).to(device)
+    oracle_forecaster.load_state_dict(torch.load(
+        os.path.join(path_model_save, f"forecaster_exp{args.expid}_run{runid}.pth"),
+        weights_only=True,
+    ))
+    oracle_forecaster.eval()
+
     csci_model.eval()
     forecaster.eval()
 
@@ -440,8 +459,8 @@ def main(args, runid):
                 outputs_obs.append(preds_all[:, idx_current_nodes, :])
                 outputs_miss.append(preds_all[:, miss_idx_np, :])
 
-                # Oracle path: forecaster on unmasked full input
-                oracle_preds = forecaster(testx, idx=all_idx_tensor, args=args)
+                # Oracle path: Stage 1 forecaster on unmasked full input
+                oracle_preds = oracle_forecaster(testx, idx=all_idx_tensor, args=args)
                 oracle_preds = oracle_preds.transpose(1, 3)[:, 0, :, :]
                 outputs_oracle.append(oracle_preds[:, idx_current_nodes, :])
 
