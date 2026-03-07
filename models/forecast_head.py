@@ -98,8 +98,8 @@ class ForecastHead(nn.Module):
 
         # Reassemble full time series
         x_full = torch.zeros(B, self.T, self.N, device=x_obs.device)
-        x_full[:, :, obs_idx] = x_obs                # observed: original values
-        x_full[:, :, miss_idx] = x_miss_hat           # missing: iFFT reconstruction
+        x_full[:, :, obs_idx.cpu()] = x_obs                # observed: original values
+        x_full[:, :, miss_idx.cpu()] = x_miss_hat           # missing: iFFT reconstruction
 
         # [B, T, N] → [B, in_dim=1, N, T]
         out = x_full.unsqueeze(1).permute(0, 1, 3, 2)  # [B, 1, N, T]

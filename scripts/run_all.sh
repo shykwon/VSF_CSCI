@@ -3,6 +3,7 @@
 # Each dataset assigned to a separate GPU for parallel execution.
 # Uses nohup for background execution (survives session disconnect).
 
+PYTHON=/home/sheda7788/.conda/envs/tslib_env/bin/python
 EXPID=1
 SEED=3407
 
@@ -15,7 +16,7 @@ mkdir -p logs/train logs/eval
 
 # ── GPU 0: METR-LA ──
 echo "[GPU 0] Starting METR-LA..."
-nohup python -u main_csci.py \
+nohup $PYTHON -u main_csci.py \
     --data data/METR-LA \
     --adj_data data/sensor_graph/adj_mx.pkl \
     --device cuda:0 \
@@ -39,7 +40,7 @@ echo "  PID: $PID_METRLA"
 
 # ── GPU 1: SOLAR ──
 echo "[GPU 1] Starting SOLAR..."
-nohup python -u main_csci.py \
+nohup $PYTHON -u main_csci.py \
     --data data/SOLAR \
     --device cuda:1 \
     --seed $SEED \
@@ -63,7 +64,7 @@ echo "  PID: $PID_SOLAR"
 # ── GPU 2: ECG5000 + TRAFFIC (sequential, share GPU) ──
 echo "[GPU 2] Starting ECG5000..."
 nohup bash -c "
-    python -u main_csci.py \
+    $PYTHON -u main_csci.py \
         --data data/ECG5000 \
         --device cuda:2 \
         --seed $SEED \
@@ -82,7 +83,7 @@ nohup bash -c "
         --weight_decay 0.0001 \
     && \
     echo '[GPU 2] ECG5000 done. Starting TRAFFIC...' && \
-    python -u main_csci.py \
+    $PYTHON -u main_csci.py \
         --data data/TRAFFIC \
         --device cuda:2 \
         --seed $SEED \

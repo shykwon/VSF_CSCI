@@ -99,6 +99,12 @@ class CSCI(nn.Module):
             )  # h: [B, T, N, d_model]
             fc_input = self.forecast_head(h=h)  # [B, in_dim, N, T]
 
+            # σ-based confidence gating: high uncertainty → attenuated input
+            # attn_bias [B, N]: 0 for observed, σ_mean for missing
+            # confidence [B, 1, N, 1]: sigmoid(-attn_bias) → ~1.0 for obs, <1.0 for uncertain miss
+            confidence = torch.sigmoid(-attn_bias).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+            fc_input = fc_input * confidence
+
         else:  # 'timeseries' — ablation (VIDA-style iFFT)
             # iFFT path: V_miss → time series reconstruction → forecaster input
             fc_input = self.forecast_head(

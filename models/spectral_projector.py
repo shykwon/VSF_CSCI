@@ -88,11 +88,11 @@ class SpectralProjector(nn.Module):
 
         # --- Reassemble in original variable order ---
         h = torch.zeros(B, T, self.N, d, device=x_obs.device)
-        h[:, :, obs_idx, :] = e_obs
-        h[:, :, miss_idx, :] = e_miss
+        h[:, :, obs_idx.cpu(), :] = e_obs
+        h[:, :, miss_idx.cpu(), :] = e_miss
 
         # --- Attention bias ---
         attn_bias = torch.zeros(B, self.N, device=x_obs.device)
-        attn_bias[:, miss_idx] = sigma.mean(dim=1)  # [B, M] freq-averaged σ
+        attn_bias[:, miss_idx.cpu()] = sigma.mean(dim=1)  # [B, M] freq-averaged σ
 
         return h, attn_bias
