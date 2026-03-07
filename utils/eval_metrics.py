@@ -14,12 +14,13 @@ def crps_gaussian(mu, sigma, y):
 
     Args:
         mu: [B, F, M] predicted mean (V_miss_hat amplitude)
-        sigma: [B, F, M] predicted std (uncertainty)
+        sigma: [B, F, M] Wiener residual variance (not std)
         y: [B, F, M] ground truth (V_miss_true amplitude)
     Returns:
         scalar: mean CRPS
     """
-    sigma = torch.clamp(sigma, min=1e-6)
+    # sigma is Wiener residual variance → convert to std for Gaussian CRPS
+    sigma = torch.sqrt(torch.clamp(sigma, min=1e-6))
     z = (y - mu) / sigma
     # CRPS = σ * (z * (2Φ(z) - 1) + 2φ(z) - 1/√π)
     phi_z = torch.exp(-0.5 * z ** 2) / np.sqrt(2 * np.pi)  # PDF
