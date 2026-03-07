@@ -41,13 +41,11 @@ def zero_out_remaining_input(testx, idx_current_nodes, device):
 
 def get_curriculum_mask_ratio(epoch, max_epoch=120, max_ratio=0.85):
     """
-    Progressive masking curriculum for CSCI training.
+    Smooth linear masking curriculum for CSCI training.
 
-    Schedule:
-        Epoch 1~25%:   miss rate up to 30%
-        Epoch 25~50%:  miss rate up to 60%
-        Epoch 50~75%:  miss rate up to 85%
-        Epoch 75~100%: random uniform sampling [0, max_ratio]
+    Miss rate upper bound increases linearly from 0 to max_ratio over training.
+    Each epoch samples uniformly from [0, current_upper_bound].
+    This avoids abrupt miss rate jumps that cause loss explosion.
 
     Args:
         epoch: current epoch (0-indexed)
@@ -56,14 +54,9 @@ def get_curriculum_mask_ratio(epoch, max_epoch=120, max_ratio=0.85):
     Returns:
         mask_ratio: float in [0, max_ratio]
     """
-    if epoch < max_epoch * 0.25:
-        return np.random.uniform(0, 0.30)
-    elif epoch < max_epoch * 0.50:
-        return np.random.uniform(0, 0.60)
-    elif epoch < max_epoch * 0.75:
-        return np.random.uniform(0, 0.85)
-    else:
-        return np.random.uniform(0, max_ratio)
+    progress = min(epoch / max(max_epoch - 1, 1), 1.0)
+    upper_bound = progress * max_ratio  # linearly 0 → max_ratio
+    return np.random.uniform(0, max(upper_bound, 0.01))
 
 
 def get_idx_subset_from_idx_all_nodes(idx_all_nodes, mask_ratio=0.15):
