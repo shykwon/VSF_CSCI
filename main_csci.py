@@ -349,6 +349,8 @@ def main(args, runid):
     run_mae_all = []   # [split_runs, seq_out_len]
     run_rmse_all = []
 
+    all_idx_tensor = torch.arange(args.num_nodes).to(device)
+
     for split_run in range(args.random_node_idx_split_runs):
         idx_current_nodes = get_node_random_idx_split(
             args, args.num_nodes,
@@ -356,45 +358,67 @@ def main(args, runid):
             args.upper_limit_random_node_selections,
         )
         obs_idx = torch.tensor(idx_current_nodes, dtype=torch.long).to(device)
-        miss_idx = torch.tensor(
-            np.setdiff1d(np.arange(args.num_nodes), idx_current_nodes),
-            dtype=torch.long
-        ).to(device)
+        miss_idx_np = np.setdiff1d(np.arange(args.num_nodes), idx_current_nodes)
+        miss_idx = torch.tensor(miss_idx_np, dtype=torch.long).to(device)
 
-        # Per-split realy subset (VIDA protocol: subset inside split loop)
-        realy_subset = realy[:, idx_current_nodes, :]
+        # Per-split realy subsets
+        realy_obs = realy[:, idx_current_nodes, :]
+        realy_miss = realy[:, miss_idx_np, :]
 
-        outputs = []
+        outputs_obs = []      # CSCI → obs vars
+        outputs_miss = []     # CSCI → miss vars
+        outputs_oracle = []   # Forecaster on full input → obs vars
+
         for iter, (x, y) in enumerate(dataloader['test_loader'].get_iterator()):
             testx = torch.Tensor(x).to(device).transpose(1, 3)
             testx_masked = zero_out_remaining_input(testx.clone(), idx_current_nodes, args.device)
 
             with torch.no_grad():
+                # CSCI path
                 fc_input, attn_bias, _, _ = csci_model(testx_masked, obs_idx, miss_idx)
-                preds = forecaster(fc_input, idx=torch.arange(args.num_nodes).to(device), args=args)
-                preds = preds.transpose(1, 3)[:, 0, :, :]
-                preds = preds[:, idx_current_nodes, :]
+                preds_all = forecaster(fc_input, idx=all_idx_tensor, args=args)
+                preds_all = preds_all.transpose(1, 3)[:, 0, :, :]
 
-            outputs.append(preds)
+                outputs_obs.append(preds_all[:, idx_current_nodes, :])
+                outputs_miss.append(preds_all[:, miss_idx_np, :])
 
-        yhat = torch.cat(outputs, dim=0)
-        yhat = yhat[:realy_subset.size(0), ...]
+                # Oracle path: forecaster on unmasked full input
+                oracle_preds = forecaster(testx, idx=all_idx_tensor, args=args)
+                oracle_preds = oracle_preds.transpose(1, 3)[:, 0, :, :]
+                outputs_oracle.append(oracle_preds[:, idx_current_nodes, :])
 
-        mae_list, rmse_list = [], []
+        yhat_obs = torch.cat(outputs_obs, dim=0)[:realy_obs.size(0)]
+        yhat_miss = torch.cat(outputs_miss, dim=0)[:realy_miss.size(0)]
+        yhat_oracle = torch.cat(outputs_oracle, dim=0)[:realy_obs.size(0)]
+
+        # Compute per-horizon metrics for all 3 settings
+        obs_mae, obs_rmse = [], []
+        miss_mae, miss_rmse = [], []
+        oracle_mae, oracle_rmse = [], []
+
         for h in range(args.seq_out_len):
-            pred = scaler.inverse_transform(yhat[:, :, h])
-            real = realy_subset[:, :, h]
-            m, r = metric(pred, real)
-            mae_list.append(m)
-            rmse_list.append(r)
+            # Obs (CSCI → observed vars, VIDA-compatible)
+            m, r = metric(scaler.inverse_transform(yhat_obs[:, :, h]), realy_obs[:, :, h])
+            obs_mae.append(m); obs_rmse.append(r)
 
-        run_mae_all.append(mae_list)
-        run_rmse_all.append(rmse_list)
-        tracker.log_eval_split(split_run, mae_list, rmse_list)
+            # Miss (CSCI → missing vars, reconstruction quality)
+            m, r = metric(scaler.inverse_transform(yhat_miss[:, :, h]), realy_miss[:, :, h])
+            miss_mae.append(m); miss_rmse.append(r)
+
+            # Oracle (full input → observed vars, upper bound)
+            m, r = metric(scaler.inverse_transform(yhat_oracle[:, :, h]), realy_obs[:, :, h])
+            oracle_mae.append(m); oracle_rmse.append(r)
+
+        run_mae_all.append(obs_mae)
+        run_rmse_all.append(obs_rmse)
+        tracker.log_eval_split(split_run, obs_mae, obs_rmse,
+                               miss_mae=miss_mae, miss_rmse=miss_rmse,
+                               oracle_mae=oracle_mae, oracle_rmse=oracle_rmse)
 
         if split_run % 10 == 0:
-            print(f"  Split {split_run:3d} | MAE: {np.mean(mae_list):.4f} | "
-                  f"RMSE: {np.mean(rmse_list):.4f} | nodes: {len(idx_current_nodes)}")
+            print(f"  Split {split_run:3d} | "
+                  f"obsMAE: {np.mean(obs_mae):.4f}  missMAE: {np.mean(miss_mae):.4f}  "
+                  f"oracleMAE: {np.mean(oracle_mae):.4f} | nodes: {len(idx_current_nodes)}")
 
     # Save results
     tracker.save()
