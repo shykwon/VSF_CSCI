@@ -135,8 +135,9 @@ def main(args, runid):
     print(f"Number of variables/nodes = {args.num_nodes}")
 
     dataset_name = args.data.strip().split('/')[-1].strip()
-    if dataset_name == "METR-LA":
-        args.in_dim = 1  # CSCI uses channel 0 only for spectral analysis
+    # METR-LA has time_of_day as 2nd channel (in_dim=2 in original data)
+    # Stage 1 forecaster trains with in_dim from data for fair VIDA comparison.
+    # CSCI spectral analysis uses channel 0 only (handled internally).
 
     path_model_save = f"./saved_models/{args.model_name}/{dataset_name}/seed{args.seed}/"
     os.makedirs(path_model_save, exist_ok=True)
@@ -345,6 +346,9 @@ def main(args, runid):
     realy = torch.Tensor(dataloader['y_test']).to(device)
     realy = realy.transpose(1, 3)[:, 0, :, :]
 
+    run_mae_all = []   # [split_runs, seq_out_len]
+    run_rmse_all = []
+
     for split_run in range(args.random_node_idx_split_runs):
         idx_current_nodes = get_node_random_idx_split(
             args, args.num_nodes,
@@ -356,6 +360,9 @@ def main(args, runid):
             np.setdiff1d(np.arange(args.num_nodes), idx_current_nodes),
             dtype=torch.long
         ).to(device)
+
+        # Per-split realy subset (VIDA protocol: subset inside split loop)
+        realy_subset = realy[:, idx_current_nodes, :]
 
         outputs = []
         for iter, (x, y) in enumerate(dataloader['test_loader'].get_iterator()):
@@ -371,7 +378,6 @@ def main(args, runid):
             outputs.append(preds)
 
         yhat = torch.cat(outputs, dim=0)
-        realy_subset = realy[:, idx_current_nodes, :]
         yhat = yhat[:realy_subset.size(0), ...]
 
         mae_list, rmse_list = [], []
@@ -382,6 +388,8 @@ def main(args, runid):
             mae_list.append(m)
             rmse_list.append(r)
 
+        run_mae_all.append(mae_list)
+        run_rmse_all.append(rmse_list)
         tracker.log_eval_split(split_run, mae_list, rmse_list)
 
         if split_run % 10 == 0:
@@ -390,10 +398,10 @@ def main(args, runid):
 
     # Save results
     tracker.save()
-    summary = tracker.save_summary()
+    tracker.save_summary()
     tracker.print_summary()
 
-    return summary
+    return run_mae_all, run_rmse_all
 
 
 if __name__ == "__main__":
@@ -409,9 +417,37 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
     print(args)
 
+    # Collect results across all runs (VIDA protocol: runs × splits)
+    all_mae = []
+    all_rmse = []
+
     for run_i in range(args.runs):
         print(f"\n>>> Run {run_i + 1}/{args.runs}")
-        main(args, run_i)
+        run_mae, run_rmse = main(args, run_i)
+        all_mae.extend(run_mae)
+        all_rmse.extend(run_rmse)
+
+    # Aggregate across all runs × splits (VIDA-compatible reporting)
+    all_mae = np.array(all_mae)   # [total_splits, seq_out_len]
+    all_rmse = np.array(all_rmse)
+
+    amae = np.mean(all_mae, axis=0)    # [seq_out_len]
+    armse = np.mean(all_rmse, axis=0)
+    smae = np.std(all_mae, axis=0)
+    srmse = np.std(all_rmse, axis=0)
+
+    print(f"\n\n{'='*60}")
+    print(f"  Final Results ({args.runs} runs × {args.random_node_idx_split_runs} splits)")
+    print(f"{'='*60}")
+    for i in range(args.seq_out_len):
+        print(f"  h{i+1:2d}  MAE: {amae[i]:.4f} +- {smae[i]:.4f}  |  "
+              f"RMSE: {armse[i]:.4f} +- {srmse[i]:.4f}")
+    print(f"{'─'*60}")
+    print(f"  Final  MAE: {np.mean(amae):.4f} +- {np.mean(smae):.4f}  |  "
+          f"RMSE: {np.mean(armse):.4f} +- {np.mean(srmse):.4f}")
+    print(f"  Final  MAE: {np.mean(amae):.2f}({np.mean(smae):.2f})  |  "
+          f"RMSE: {np.mean(armse):.2f}({np.mean(srmse):.2f})")
+    print(f"{'='*60}")
 
     endtime = datetime.datetime.now()
     print(f"\nTotal time: {(endtime - starttime).seconds}s")

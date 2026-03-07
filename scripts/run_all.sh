@@ -23,7 +23,7 @@ nohup $PYTHON -u main_csci.py \
     --seed $SEED \
     --expid $EXPID \
     --model_name mtgnn \
-    --in_dim 1 \
+    --in_dim 2 \
     --d_model 64 \
     --fc_epochs 100 \
     --csci_epochs 100 \

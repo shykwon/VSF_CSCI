@@ -38,6 +38,7 @@ class CSCI(nn.Module):
 
         self.N = N
         self.T = T
+        self.in_dim = in_dim
         self.head_mode = head_mode
 
         # Module 1: Spectral Encoder
@@ -49,9 +50,10 @@ class CSCI(nn.Module):
         # Module 3: Spectral Projector (always built, used in embedding mode)
         self.spectral_projector = SpectralProjector(N, F, T, d_model)
 
-        # Module 4: Forecast Head (adapts output to forecaster input)
+        # Module 4: Forecast Head (always outputs 1 channel — value only)
+        # Extra channels (e.g. time_of_day) bypass CSCI and are concatenated after
         self.forecast_head = ForecastHead(
-            mode=head_mode, N=N, T=T, d_model=d_model, in_dim=in_dim,
+            mode=head_mode, N=N, T=T, d_model=d_model, in_dim=1,
         )
 
     def forward(
@@ -112,5 +114,11 @@ class CSCI(nn.Module):
                 obs_idx=obs_idx, miss_idx=miss_idx,
             )  # [B, in_dim, N, T]
             attn_bias = None
+
+        # Bypass: concat extra channels (e.g. time_of_day) that don't go through CSCI
+        # These are "always known" features — no imputation needed
+        if self.in_dim > 1:
+            extra_channels = x_full[:, 1:, :, :]  # [B, in_dim-1, N, T]
+            fc_input = torch.cat([fc_input, extra_channels], dim=1)  # [B, in_dim, N, T]
 
         return fc_input, attn_bias, V_miss_hat, sigma
