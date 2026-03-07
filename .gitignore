@@ -1,0 +1,35 @@
+# Data
+data/
+
+# Model checkpoints
+saved_models/
+
+# Experiment results (regenerable)
+results/raw/
+results/figures/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env
+venv/
+.venv/
