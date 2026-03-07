@@ -1,10 +1,10 @@
 #!/bin/bash
 # Full experiment — proper training for performance evaluation
 # fc_epochs=100, csci_epochs=100, 100 splits, 1 run
-# Confidence fix (exp) applied
+# Bug fixes applied: V_miss_true from unmasked input, tod bypass fix, val curriculum fix
 
 PYTHON=/home/sheda7788/.conda/envs/tslib_env/bin/python
-EXPID=1
+EXPID=3
 SEED=3407
 FC_EP=100
 CSCI_EP=100

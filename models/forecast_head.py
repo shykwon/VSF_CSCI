@@ -11,18 +11,18 @@ class ForecastHead(nn.Module):
     Adapts CSCI output to forecaster input format.
 
     Two modes:
-      1. 'embedding' (default): h [B, T, N, d_model] → projection → [B, in_dim, N, T]
-         - CSCI의 핵심 경로. iFFT 없이 임베딩 직접 주입.
-         - σ 기반 attn_bias를 forecaster에 전달 가능.
+      1. 'embedding' (default): h [B, T, N, d_model] → permute → [B, d_model, N, T]
+         - CSCI의 핵심 경로. d_model 차원 임베딩을 그대로 백본에 주입.
+         - 백본의 start_conv/skip0만 교체하여 d_model 채널 수용.
 
-      2. 'timeseries' (ablation): V_miss → iFFT → 시계열 복원 → [B, in_dim, N, T]
+      2. 'timeseries' (ablation): V_miss → iFFT → 시계열 복원 → [B, 1, N, T]
          - VIDA와 동일한 2-Stage 방식. H2 가설 검증용.
          - 관측값은 원본으로 대체 (VIDA 프로토콜).
 
     Usage:
-        head = ForecastHead(mode='embedding', d_model=64, in_dim=1)
-        fc_input = head(h=h, ...)               # embedding mode
-        fc_input = head(V_miss=V, x_obs=x, ...)  # timeseries mode
+        head = ForecastHead(mode='embedding', d_model=64)
+        fc_input = head(h=h, ...)               # embedding mode → [B, d_model, N, T]
+        fc_input = head(V_miss=V, x_obs=x, ...)  # timeseries mode → [B, 1, N, T]
     """
 
     def __init__(self, mode: str, N: int, T: int, d_model: int = 64, in_dim: int = 1):
@@ -32,7 +32,7 @@ class ForecastHead(nn.Module):
             N: total number of variables
             T: input sequence length
             d_model: CSCI embedding dimension (only for embedding mode)
-            in_dim: forecaster input channels (typically 1)
+            in_dim: forecaster input channels (only for timeseries mode)
         """
         super().__init__()
         self.mode = mode
@@ -42,8 +42,8 @@ class ForecastHead(nn.Module):
         self.in_dim = in_dim
 
         if mode == 'embedding':
-            # Project d_model → in_dim for forecaster compatibility
-            self.emb_to_ts = nn.Linear(d_model, in_dim)
+            # No projection — pass d_model dims directly to backbone
+            pass
         elif mode == 'timeseries':
             # No learnable params needed — just iFFT + reassemble
             pass
@@ -62,7 +62,8 @@ class ForecastHead(nn.Module):
     ) -> torch.Tensor:
         """
         Returns:
-            fc_input: [B, in_dim, N, T] — ready for forecaster
+            embedding mode: [B, d_model, N, T]
+            timeseries mode: [B, 1, N, T]
         """
         if self.mode == 'embedding':
             return self._embedding_path(h)
@@ -71,11 +72,10 @@ class ForecastHead(nn.Module):
 
     def _embedding_path(self, h: torch.Tensor) -> torch.Tensor:
         """
-        h [B, T, N, d_model] → Linear → [B, T, N, in_dim] → permute → [B, in_dim, N, T]
+        h [B, T, N, d_model] → permute → [B, d_model, N, T]
+        No projection — full embedding passed to backbone.
         """
-        out = self.emb_to_ts(h)              # [B, T, N, in_dim]
-        out = out.permute(0, 3, 2, 1)        # [B, in_dim, N, T]
-        return out
+        return h.permute(0, 3, 2, 1)  # [B, d_model, N, T]
 
     def _timeseries_path(
         self,

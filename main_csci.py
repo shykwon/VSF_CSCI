@@ -234,8 +234,46 @@ def main(args, runid):
     print("  Forecaster loaded (best val loss).\n")
 
     # ══════════════════════════════════════════════════
-    #  Stage 2: CSCI Training (Forecaster Frozen)
+    #  Stage 2: CSCI Training (Forecaster input layer replaced)
     # ══════════════════════════════════════════════════
+
+    # Replace backbone input layers to accept d_model-dim embedding
+    csci_in_dim = csci_model.get_csci_in_dim()
+    print(f"  Replacing forecaster input layers: in_dim {args.in_dim} → {csci_in_dim}")
+
+    forecaster.start_conv = nn.Conv2d(
+        in_channels=csci_in_dim,
+        out_channels=args.residual_channels,
+        kernel_size=(1, 1),
+    ).to(device)
+
+    if args.seq_in_len > forecaster.receptive_field:
+        forecaster.skip0 = nn.Conv2d(
+            in_channels=csci_in_dim,
+            out_channels=args.skip_channels,
+            kernel_size=(1, args.seq_in_len),
+            bias=True,
+        ).to(device)
+    else:
+        forecaster.skip0 = nn.Conv2d(
+            in_channels=csci_in_dim,
+            out_channels=args.skip_channels,
+            kernel_size=(1, forecaster.receptive_field),
+            bias=True,
+        ).to(device)
+
+    print(f"  start_conv: Conv2d({csci_in_dim}, {args.residual_channels}, (1,1))")
+    print(f"  skip0: Conv2d({csci_in_dim}, {args.skip_channels}, ...)")
+
+    # Rebuild optimizer to include new input layers
+    engine.csci_optimizer = torch.optim.Adam(
+        list(csci_model.parameters()) +
+        list(forecaster.start_conv.parameters()) +
+        list(forecaster.skip0.parameters()),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+
     print("=" * 50)
     print("  Stage 2: CSCI Training")
     print("=" * 50)
@@ -264,8 +302,11 @@ def main(args, runid):
             trainy = torch.Tensor(y).to(device).transpose(1, 3)
 
             # Random subset selection for training (curriculum-aware)
+            # Ensure at least 1 missing variable for CSCI training
             all_idx = torch.arange(args.num_nodes).to(device)
             idx_subset = get_idx_subset_from_idx_all_nodes(all_idx, mask_ratio=obs_ratio)
+            if len(idx_subset) >= args.num_nodes:
+                idx_subset = idx_subset[:args.num_nodes - 1]
             obs_idx = torch.tensor(idx_subset, dtype=torch.long).to(device)
             miss_idx = torch.tensor(
                 np.setdiff1d(np.arange(args.num_nodes), idx_subset),
@@ -275,7 +316,8 @@ def main(args, runid):
             # Zero out unobserved variables
             trainx_masked = zero_out_remaining_input(trainx.clone(), idx_subset, args.device)
 
-            metrics = engine.train_csci(args, trainx_masked, trainy[:, 0, :, :], obs_idx, miss_idx)
+            metrics = engine.train_csci(args, trainx_masked, trainy[:, 0, :, :], obs_idx, miss_idx,
+                                        input_unmasked=trainx)
             train_loss.append(metrics[0])
             train_rmse.append(metrics[1])
 
@@ -292,7 +334,9 @@ def main(args, runid):
             testy = torch.Tensor(y).to(device).transpose(1, 3)
 
             all_idx = torch.arange(args.num_nodes).to(device)
-            idx_subset = get_idx_subset_from_idx_all_nodes(all_idx)
+            idx_subset = get_idx_subset_from_idx_all_nodes(all_idx, mask_ratio=obs_ratio)
+            if len(idx_subset) >= args.num_nodes:
+                idx_subset = idx_subset[:args.num_nodes - 1]
             obs_idx = torch.tensor(idx_subset, dtype=torch.long).to(device)
             miss_idx = torch.tensor(
                 np.setdiff1d(np.arange(args.num_nodes), idx_subset),
@@ -300,7 +344,8 @@ def main(args, runid):
             ).to(device)
 
             testx_masked = zero_out_remaining_input(testx.clone(), idx_subset, args.device)
-            metrics = engine.eval_csci(args, testx_masked, testy[:, 0, :, :], obs_idx, miss_idx)
+            metrics = engine.eval_csci(args, testx_masked, testy[:, 0, :, :], obs_idx, miss_idx,
+                                       input_unmasked=testx)
             val_loss.append(metrics[0])
             val_rmse.append(metrics[1])
 
@@ -318,6 +363,11 @@ def main(args, runid):
         if mval_loss < minl:
             torch.save(csci_model.state_dict(),
                        os.path.join(path_model_save, f"csci_exp{args.expid}_run{runid}.pth"))
+            # Also save replaced input layers (start_conv, skip0)
+            torch.save({
+                'start_conv': forecaster.start_conv.state_dict(),
+                'skip0': forecaster.skip0.state_dict(),
+            }, os.path.join(path_model_save, f"fc_input_layers_exp{args.expid}_run{runid}.pth"))
             minl = mval_loss
             early_stop_counter = 0
         else:
@@ -326,12 +376,18 @@ def main(args, runid):
                 print("  Early stopping.")
                 break
 
-    # Load best CSCI
+    # Load best CSCI + input layers
     csci_model.load_state_dict(torch.load(
         os.path.join(path_model_save, f"csci_exp{args.expid}_run{runid}.pth"),
         weights_only=True,
     ))
-    print("  CSCI loaded (best val loss).\n")
+    input_layers = torch.load(
+        os.path.join(path_model_save, f"fc_input_layers_exp{args.expid}_run{runid}.pth"),
+        weights_only=True,
+    )
+    forecaster.start_conv.load_state_dict(input_layers['start_conv'])
+    forecaster.skip0.load_state_dict(input_layers['skip0'])
+    print("  CSCI + input layers loaded (best val loss).\n")
 
     # ══════════════════════════════════════════════════
     #  Inference (VIDA protocol: 100 random splits)
@@ -375,7 +431,9 @@ def main(args, runid):
 
             with torch.no_grad():
                 # CSCI path
-                fc_input, attn_bias, _, _ = csci_model(testx_masked, obs_idx, miss_idx)
+                fc_input, attn_bias, _, _ = csci_model(
+                    testx_masked, obs_idx, miss_idx, x_full_unmasked=testx
+                )
                 preds_all = forecaster(fc_input, idx=all_idx_tensor, args=args)
                 preds_all = preds_all.transpose(1, 3)[:, 0, :, :]
 

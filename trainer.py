@@ -96,25 +96,33 @@ class CSCITrainer:
 
     # ─── Stage 2: CSCI Training (Forecaster Frozen) ───
 
-    def train_csci(self, args, input, real_val, obs_idx, miss_idx):
+    def train_csci(self, args, input, real_val, obs_idx, miss_idx, input_unmasked=None):
         """
         Train CSCI modules with forecaster frozen.
 
         Args:
-            input: [B, in_dim, N, T] full input (unobserved zeroed)
+            input: [B, in_dim, N, T] masked input (unobserved zeroed)
             real_val: [B, N, T] ground truth future values
             obs_idx: [K] observed variable indices
             miss_idx: [M] missing variable indices
+            input_unmasked: [B, in_dim, N, T] original unmasked input (for spectral GT & tod bypass)
         """
-        # Freeze forecaster
-        for p in self.forecaster.parameters():
-            p.requires_grad = False
+        # Freeze forecaster (except input layers — start_conv/skip0 are trainable)
+        for name, p in self.forecaster.named_parameters():
+            if 'start_conv' in name or 'skip0' in name:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
 
         self.csci.train()
+        self.forecaster.start_conv.train()
+        self.forecaster.skip0.train()
         self.csci_optimizer.zero_grad()
 
         # Forward through CSCI → ForecastHead → forecaster-ready input
-        fc_input, attn_bias, V_miss_hat, sigma = self.csci(input, obs_idx, miss_idx)
+        fc_input, attn_bias, V_miss_hat, sigma = self.csci(
+            input, obs_idx, miss_idx, x_full_unmasked=input_unmasked
+        )
         # fc_input: [B, in_dim, N, T] — already adapted by ForecastHead
 
         # Forecaster prediction
@@ -124,10 +132,15 @@ class CSCITrainer:
 
         real = torch.unsqueeze(real_val, dim=1)
 
-        # Ground truth spectra for spectral loss (from full input)
-        V_miss_true = torch.fft.rfft(
-            input[:, 0, miss_idx, :].transpose(1, 2), dim=1, norm='ortho'
-        )  # [B, F, M]
+        # Ground truth spectra for spectral loss (from UNMASKED input)
+        gt_source = input_unmasked if input_unmasked is not None else input
+        M = miss_idx.shape[0]
+        if M > 0:
+            V_miss_true = torch.fft.rfft(
+                gt_source[:, 0, miss_idx, :].transpose(1, 2), dim=1, norm='ortho'
+            )  # [B, F, M]
+        else:
+            V_miss_true = None
 
         # Compute combined loss
         total_loss, loss_dict = self.criterion(
@@ -136,20 +149,26 @@ class CSCITrainer:
 
         total_loss.backward()
         if self.clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.csci.parameters(), self.clip)
+            # Clip both CSCI and trainable forecaster input layers
+            trainable_params = list(self.csci.parameters()) + \
+                list(self.forecaster.start_conv.parameters()) + \
+                list(self.forecaster.skip0.parameters())
+            torch.nn.utils.clip_grad_norm_(trainable_params, self.clip)
         self.csci_optimizer.step()
 
         rmse = masked_rmse(predict, real, 0.0)[0].item()
         self.iter += 1
         return total_loss.item(), rmse, loss_dict
 
-    def eval_csci(self, args, input, real_val, obs_idx, miss_idx):
+    def eval_csci(self, args, input, real_val, obs_idx, miss_idx, input_unmasked=None):
         """Evaluate CSCI + Forecaster."""
         self.csci.eval()
         self.forecaster.eval()
 
         with torch.no_grad():
-            fc_input, attn_bias, V_miss_hat, sigma = self.csci(input, obs_idx, miss_idx)
+            fc_input, attn_bias, V_miss_hat, sigma = self.csci(
+                input, obs_idx, miss_idx, x_full_unmasked=input_unmasked
+            )
 
             output = self.forecaster(fc_input, idx=torch.arange(args.num_nodes).to(self.device), args=args)
             output = output.transpose(1, 3)
@@ -157,9 +176,14 @@ class CSCITrainer:
 
             real = torch.unsqueeze(real_val, dim=1)
 
-            V_miss_true = torch.fft.rfft(
-                input[:, 0, miss_idx, :].transpose(1, 2), dim=1, norm='ortho'
-            )
+            gt_source = input_unmasked if input_unmasked is not None else input
+            M = miss_idx.shape[0]
+            if M > 0:
+                V_miss_true = torch.fft.rfft(
+                    gt_source[:, 0, miss_idx, :].transpose(1, 2), dim=1, norm='ortho'
+                )
+            else:
+                V_miss_true = None
 
             total_loss, loss_dict = self.criterion(
                 predict, real, V_miss_hat, V_miss_true, sigma
