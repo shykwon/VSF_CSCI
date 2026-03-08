@@ -40,8 +40,13 @@ class CSCITrainer:
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
+        # Stage 2 optimizer: CSCI + forecaster input layers + norm layers
+        stage2_params = list(self.csci.parameters()) + \
+            list(self.forecaster.start_conv.parameters()) + \
+            list(self.forecaster.skip0.parameters()) + \
+            [p for n, p in self.forecaster.named_parameters() if 'norm' in n]
         self.csci_optimizer = optim.Adam(
-            self.csci.parameters(),
+            stage2_params,
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
@@ -178,16 +183,22 @@ class CSCITrainer:
             miss_idx: [M] missing variable indices
             input_unmasked: [B, in_dim, N, T] original unmasked input (for spectral GT & tod bypass)
         """
-        # Freeze forecaster (except input layers — start_conv/skip0 are trainable)
+        # Freeze forecaster — what to unfreeze depends on head mode
+        projected = (self.csci.head_mode == 'projected')
         for name, p in self.forecaster.named_parameters():
-            if 'start_conv' in name or 'skip0' in name:
-                p.requires_grad = True
+            if projected:
+                # Projected mode: only norm layers trainable (input layers unchanged)
+                p.requires_grad = ('norm' in name)
             else:
-                p.requires_grad = False
+                # Embedding mode: input layers + norm trainable
+                p.requires_grad = ('start_conv' in name or 'skip0' in name or 'norm' in name)
 
         self.csci.train()
-        self.forecaster.start_conv.train()
-        self.forecaster.skip0.train()
+        if not projected:
+            self.forecaster.start_conv.train()
+            self.forecaster.skip0.train()
+        for m in self.forecaster.norm:
+            m.train()
         self.csci_optimizer.zero_grad()
 
         # Forward through CSCI → ForecastHead → forecaster-ready input
@@ -220,10 +231,9 @@ class CSCITrainer:
 
         total_loss.backward()
         if self.clip is not None:
-            # Clip both CSCI and trainable forecaster input layers
-            trainable_params = list(self.csci.parameters()) + \
-                list(self.forecaster.start_conv.parameters()) + \
-                list(self.forecaster.skip0.parameters())
+            # Clip all trainable parameters
+            trainable_params = [p for p in self.csci.parameters() if p.requires_grad] + \
+                [p for p in self.forecaster.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable_params, self.clip)
         self.csci_optimizer.step()
 

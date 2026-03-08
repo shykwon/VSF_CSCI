@@ -86,6 +86,12 @@ class SpectralProjector(nn.Module):
         e_time = self.freq_to_time(e_freq)     # [B, M, d, T]
         e_miss = e_time.permute(0, 3, 1, 2)   # [B, T, M, d]
 
+        # --- Scale alignment: match miss embedding scale to obs ---
+        if M > 0:
+            obs_scale = e_obs.std().detach() + 1e-6
+            miss_scale = e_miss.std().detach() + 1e-6
+            e_miss = e_miss * (obs_scale / miss_scale)
+
         # --- Reassemble in original variable order ---
         h = torch.zeros(B, T, self.N, d, device=x_obs.device)
         h[:, :, obs_idx.cpu(), :] = e_obs
