@@ -76,10 +76,10 @@ def build_args():
     # ── Model: CSCI ──
     parser.add_argument('--d_model', type=int, default=64, help='CSCI embedding dimension')
     parser.add_argument('--lambda_reg', type=float, default=0.1, help='Wiener filter regularization')
-    parser.add_argument('--head_mode', type=str, default='projected',
-                        choices=['embedding', 'projected', 'timeseries'],
+    parser.add_argument('--head_mode', type=str, default='embedding',
+                        choices=['embedding', 'timeseries'],
                         help="'embedding': CSCI path (no iFFT), 'timeseries': ablation (iFFT, VIDA-style)")
-    parser.add_argument('--s_rank', type=int, default=0, help='Low-rank S rank (0=auto: N//10)')
+    parser.add_argument('--s_rank', type=int, default=16, help='Low-rank S matrix rank')
     parser.add_argument('--s_epochs', type=int, default=20, help='Stage 1.5: S-only training epochs')
     parser.add_argument('--n_rounds', type=int, default=1,
                         help='Hierarchical propagation rounds (1=disabled, 2=default for 85%%)')
@@ -285,57 +285,42 @@ def main(args, runid):
     #  Stage 2: CSCI Training (Forecaster input layer replaced)
     # ══════════════════════════════════════════════════
 
+    # Replace backbone input layers to accept d_model-dim embedding
     csci_in_dim = csci_model.get_csci_in_dim()
+    print(f"  Replacing forecaster input layers: in_dim {args.in_dim} → {csci_in_dim}")
 
-    if args.head_mode == 'projected':
-        # Projected mode: output is [B, in_dim, N, T] — same as Stage 1
-        # No input layer replacement needed → Stage 1 weights fully reused
-        print(f"  Projected mode: no input layer replacement (in_dim={csci_in_dim})")
-        # Optimizer: only CSCI params (forecaster fully frozen except norm)
-        stage2_params = list(csci_model.parameters()) + \
-            [p for n, p in forecaster.named_parameters() if 'norm' in n]
-        engine.csci_optimizer = torch.optim.Adam(
-            stage2_params,
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-        )
-    else:
-        # Embedding/timeseries mode: replace input layers
-        print(f"  Replacing forecaster input layers: in_dim {args.in_dim} → {csci_in_dim}")
-        forecaster.start_conv = nn.Conv2d(
+    forecaster.start_conv = nn.Conv2d(
+        in_channels=csci_in_dim,
+        out_channels=args.residual_channels,
+        kernel_size=(1, 1),
+    ).to(device)
+
+    if args.seq_in_len > forecaster.receptive_field:
+        forecaster.skip0 = nn.Conv2d(
             in_channels=csci_in_dim,
-            out_channels=args.residual_channels,
-            kernel_size=(1, 1),
+            out_channels=args.skip_channels,
+            kernel_size=(1, args.seq_in_len),
+            bias=True,
+        ).to(device)
+    else:
+        forecaster.skip0 = nn.Conv2d(
+            in_channels=csci_in_dim,
+            out_channels=args.skip_channels,
+            kernel_size=(1, forecaster.receptive_field),
+            bias=True,
         ).to(device)
 
-        if args.seq_in_len > forecaster.receptive_field:
-            forecaster.skip0 = nn.Conv2d(
-                in_channels=csci_in_dim,
-                out_channels=args.skip_channels,
-                kernel_size=(1, args.seq_in_len),
-                bias=True,
-            ).to(device)
-        else:
-            forecaster.skip0 = nn.Conv2d(
-                in_channels=csci_in_dim,
-                out_channels=args.skip_channels,
-                kernel_size=(1, forecaster.receptive_field),
-                bias=True,
-            ).to(device)
+    print(f"  start_conv: Conv2d({csci_in_dim}, {args.residual_channels}, (1,1))")
+    print(f"  skip0: Conv2d({csci_in_dim}, {args.skip_channels}, ...)")
 
-        print(f"  start_conv: Conv2d({csci_in_dim}, {args.residual_channels}, (1,1))")
-        print(f"  skip0: Conv2d({csci_in_dim}, {args.skip_channels}, ...)")
-
-        # Rebuild optimizer to include new input layers + norm
-        stage2_params = list(csci_model.parameters()) + \
-            list(forecaster.start_conv.parameters()) + \
-            list(forecaster.skip0.parameters()) + \
-            [p for n, p in forecaster.named_parameters() if 'norm' in n]
-        engine.csci_optimizer = torch.optim.Adam(
-            stage2_params,
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-        )
+    # Rebuild optimizer to include new input layers
+    engine.csci_optimizer = torch.optim.Adam(
+        list(csci_model.parameters()) +
+        list(forecaster.start_conv.parameters()) +
+        list(forecaster.skip0.parameters()),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
 
     print("=" * 50)
     print("  Stage 2: CSCI Training")
@@ -426,12 +411,11 @@ def main(args, runid):
         if mval_loss < minl:
             torch.save(csci_model.state_dict(),
                        os.path.join(path_model_save, f"csci_exp{args.expid}_run{runid}.pth"))
-            if args.head_mode != 'projected':
-                # Save replaced input layers (not needed for projected mode)
-                torch.save({
-                    'start_conv': forecaster.start_conv.state_dict(),
-                    'skip0': forecaster.skip0.state_dict(),
-                }, os.path.join(path_model_save, f"fc_input_layers_exp{args.expid}_run{runid}.pth"))
+            # Also save replaced input layers (start_conv, skip0)
+            torch.save({
+                'start_conv': forecaster.start_conv.state_dict(),
+                'skip0': forecaster.skip0.state_dict(),
+            }, os.path.join(path_model_save, f"fc_input_layers_exp{args.expid}_run{runid}.pth"))
             minl = mval_loss
             early_stop_counter = 0
         else:
@@ -440,19 +424,18 @@ def main(args, runid):
                 print("  Early stopping.")
                 break
 
-    # Load best CSCI (+ input layers if applicable)
+    # Load best CSCI + input layers
     csci_model.load_state_dict(torch.load(
         os.path.join(path_model_save, f"csci_exp{args.expid}_run{runid}.pth"),
         weights_only=True,
     ))
-    if args.head_mode != 'projected':
-        input_layers = torch.load(
-            os.path.join(path_model_save, f"fc_input_layers_exp{args.expid}_run{runid}.pth"),
-            weights_only=True,
-        )
-        forecaster.start_conv.load_state_dict(input_layers['start_conv'])
-        forecaster.skip0.load_state_dict(input_layers['skip0'])
-    print("  CSCI loaded (best val loss).\n")
+    input_layers = torch.load(
+        os.path.join(path_model_save, f"fc_input_layers_exp{args.expid}_run{runid}.pth"),
+        weights_only=True,
+    )
+    forecaster.start_conv.load_state_dict(input_layers['start_conv'])
+    forecaster.skip0.load_state_dict(input_layers['skip0'])
+    print("  CSCI + input layers loaded (best val loss).\n")
 
     # ══════════════════════════════════════════════════
     #  Inference (VIDA protocol: 100 random splits)

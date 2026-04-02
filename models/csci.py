@@ -36,9 +36,7 @@ class CSCI(nn.Module):
         d_model = args.d_model
         in_dim = args.in_dim
         lambda_reg = getattr(args, 'lambda_reg', 0.1)
-        s_rank = getattr(args, 's_rank', 0)
-        if s_rank <= 0:
-            s_rank = max(8, N // 10)  # auto: ECG=14, SOLAR=14, METR-LA=20, TRAFFIC=86
+        s_rank = getattr(args, 's_rank', 16)
         head_mode = getattr(args, 'head_mode', 'embedding')
         self.n_rounds = getattr(args, 'n_rounds', 1)
         self.coherence_threshold = getattr(args, 'coherence_threshold', 0.3)
@@ -69,9 +67,7 @@ class CSCI(nn.Module):
     def get_csci_in_dim(self):
         """Return the channel dimension CSCI outputs for backbone input layer sizing."""
         if self.head_mode == 'embedding':
-            return self.d_model + self.n_extra
-        elif self.head_mode == 'projected':
-            return self.in_dim  # same as Stage 1 → no input layer replacement
+            return self.d_model + self.n_extra  # e.g. 64 or 65
         else:
             return 1 + self.n_extra  # timeseries mode: 1 or 2
 
@@ -118,33 +114,28 @@ class CSCI(nn.Module):
 
         # Step 3 & 4: diverge based on head mode
         if self.head_mode == 'embedding':
-            # CSCI path: Spectral Projector → embedding → [B, d_model, N, T]
+            # CSCI path: Spectral Projector → embedding (no projection)
             h, attn_bias = self.spectral_projector(
                 x_obs, V_miss_hat, sigma, obs_idx, miss_idx
             )  # h: [B, T, N, d_model]
             fc_input = self.forecast_head(h=h)  # [B, d_model, N, T]
 
-            # Confidence gating
+            # Uncertainty-based input gating (confidence gating):
+            # attn_bias [B, N]: 0 for observed, σ_mean for missing
+            # confidence = exp(-σ): σ=0 → 1.0 (observed preserved), σ>0 → <1.0 (missing attenuated)
             confidence = torch.exp(-attn_bias).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
             fc_input = fc_input * confidence
 
-        elif self.head_mode == 'projected':
-            # Projected path: miss embedding → Linear(d_model,1) + obs original → [B, 1, N, T]
-            h, attn_bias = self.spectral_projector(
-                x_obs, V_miss_hat, sigma, obs_idx, miss_idx
-            )  # h: [B, T, N, d_model]
-            fc_input = self.forecast_head(
-                h=h, x_obs=x_obs, obs_idx=obs_idx, miss_idx=miss_idx,
-            )  # [B, 1, N, T]
-
         else:  # 'timeseries' — ablation (VIDA-style iFFT)
+            # iFFT path: V_miss → time series reconstruction → forecaster input
             fc_input = self.forecast_head(
                 V_miss=V_miss_hat, x_obs=x_obs,
                 obs_idx=obs_idx, miss_idx=miss_idx,
             )  # [B, 1, N, T]
             attn_bias = None
 
-        # Bypass: extra channels (e.g. time_of_day) that don't go through CSCI
+        # Bypass: concat extra channels (e.g. time_of_day) that don't go through CSCI
+        # Use unmasked input so tod is available for ALL nodes (including missing)
         if self.n_extra > 0:
             tod_source = x_full_unmasked if x_full_unmasked is not None else x_full
             extra_channels = tod_source[:, 1:, :, :]  # [B, n_extra, N, T]

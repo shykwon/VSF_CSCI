@@ -10,19 +10,30 @@ class ForecastHead(nn.Module):
     """
     Adapts CSCI output to forecaster input format.
 
-    Three modes:
-      1. 'embedding': h [B, T, N, d_model] → permute → [B, d_model, N, T]
-         - 백본의 start_conv/skip0 교체 필요.
+    Two modes:
+      1. 'embedding' (default): h [B, T, N, d_model] → permute → [B, d_model, N, T]
+         - CSCI의 핵심 경로. d_model 차원 임베딩을 그대로 백본에 주입.
+         - 백본의 start_conv/skip0만 교체하여 d_model 채널 수용.
 
-      2. 'projected': miss 임베딩을 1채널로 projection + obs 원본 → [B, 1, N, T]
-         - 백본 입력층 교체 불필요 → Stage 1 가중치 완전 재활용.
-         - obs는 원본 시계열 그대로, miss는 학습된 projection.
+      2. 'timeseries' (ablation): V_miss → iFFT → 시계열 복원 → [B, 1, N, T]
+         - VIDA와 동일한 2-Stage 방식. H2 가설 검증용.
+         - 관측값은 원본으로 대체 (VIDA 프로토콜).
 
-      3. 'timeseries' (ablation): V_miss → iFFT → [B, 1, N, T]
-         - VIDA-style. H2 가설 검증용.
+    Usage:
+        head = ForecastHead(mode='embedding', d_model=64)
+        fc_input = head(h=h, ...)               # embedding mode → [B, d_model, N, T]
+        fc_input = head(V_miss=V, x_obs=x, ...)  # timeseries mode → [B, 1, N, T]
     """
 
     def __init__(self, mode: str, N: int, T: int, d_model: int = 64, in_dim: int = 1):
+        """
+        Args:
+            mode: 'embedding' or 'timeseries'
+            N: total number of variables
+            T: input sequence length
+            d_model: CSCI embedding dimension (only for embedding mode)
+            in_dim: forecaster input channels (only for timeseries mode)
+        """
         super().__init__()
         self.mode = mode
         self.N = N
@@ -31,14 +42,13 @@ class ForecastHead(nn.Module):
         self.in_dim = in_dim
 
         if mode == 'embedding':
+            # No projection — pass d_model dims directly to backbone
             pass
-        elif mode == 'projected':
-            # Learned projection: d_model embedding → 1-channel time series
-            self.miss_proj = nn.Linear(d_model, 1)
         elif mode == 'timeseries':
+            # No learnable params needed — just iFFT + reassemble
             pass
         else:
-            raise ValueError(f"Unknown mode: {mode}. Use 'embedding', 'projected', or 'timeseries'.")
+            raise ValueError(f"Unknown mode: {mode}. Use 'embedding' or 'timeseries'.")
 
     def forward(
         self,
@@ -57,8 +67,6 @@ class ForecastHead(nn.Module):
         """
         if self.mode == 'embedding':
             return self._embedding_path(h)
-        elif self.mode == 'projected':
-            return self._projected_path(h, x_obs, obs_idx, miss_idx)
         else:
             return self._timeseries_path(V_miss, x_obs, obs_idx, miss_idx)
 
@@ -68,34 +76,6 @@ class ForecastHead(nn.Module):
         No projection — full embedding passed to backbone.
         """
         return h.permute(0, 3, 2, 1)  # [B, d_model, N, T]
-
-    def _projected_path(
-        self,
-        h: torch.Tensor,
-        x_obs: torch.Tensor,
-        obs_idx: torch.Tensor,
-        miss_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Projected mode: miss embedding → Linear → 1ch + obs original → [B, 1, N, T]
-        No backbone input layer replacement needed.
-
-        h [B, T, N, d_model] — only miss positions used
-        x_obs [B, T, K] — original observed time series
-        """
-        B = x_obs.shape[0]
-
-        # Miss: project embedding to 1-channel
-        h_miss = h[:, :, miss_idx, :]          # [B, T, M, d_model]
-        x_miss_proj = self.miss_proj(h_miss).squeeze(-1)  # [B, T, M]
-
-        # Reassemble: obs original + miss projected
-        x_full = torch.zeros(B, self.T, self.N, device=x_obs.device)
-        x_full[:, :, obs_idx.cpu()] = x_obs
-        x_full[:, :, miss_idx.cpu()] = x_miss_proj
-
-        # [B, T, N] → [B, 1, N, T]
-        return x_full.unsqueeze(1).permute(0, 1, 3, 2)
 
     def _timeseries_path(
         self,
