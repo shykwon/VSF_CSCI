@@ -1,5 +1,3 @@
 from models.spectral_encoder import SpectralEncoder
 from models.cross_spectral_estimator import CrossSpectralEstimator
-from models.spectral_projector import SpectralProjector
-from models.forecast_head import ForecastHead
-from models.csci import CSCI
+from models.csci import CVFA

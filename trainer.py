@@ -1,4 +1,4 @@
-# CSCI Trainer
+# CVFA Trainer
 # Aligned with VIDA's DATrainer_v2 structure for fair comparison.
 
 import torch
@@ -8,30 +8,29 @@ import numpy as np
 from utils.metrics import masked_mae, masked_rmse
 
 
-class CSCITrainer:
+class CVFATrainer:
     """
-    Training engine for CSCI model.
+    Training engine for CVFA model.
 
     Stages (aligned with VIDA for fair comparison):
-        Stage 1: Forecaster pre-training (full variables, no CSCI)
-        Stage 2: CSCI module training (forecaster frozen)
-        Stage 3: Joint fine-tuning (optional)
+        Stage 1: Forecaster pre-training (full variables, no CVFA)
+        Stage 1.5: S-matrix learning (spectral alignment only)
+        Stage 2: CVFA module training (forecaster frozen)
     """
 
-    def __init__(self, args, csci_model, forecaster, scaler, device):
+    def __init__(self, args, cvfa_model, forecaster, scaler, device):
         self.args = args
-        self.csci = csci_model
+        self.cvfa = cvfa_model
         self.forecaster = forecaster
         self.scaler = scaler
         self.device = device
         self.clip = args.clip
 
-        # Loss
-        from models.loss import CSCILoss
-        self.criterion = CSCILoss(
+        # Loss (2-term: forecast + spectral)
+        from models.loss import CVFALoss
+        self.criterion = CVFALoss(
             alpha=args.alpha_loss,
             beta=args.beta_loss,
-            gamma=args.gamma_loss,
         )
 
         # Optimizers (created per stage)
@@ -40,8 +39,8 @@ class CSCITrainer:
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
-        self.csci_optimizer = optim.Adam(
-            self.csci.parameters(),
+        self.cvfa_optimizer = optim.Adam(
+            self.cvfa.parameters(),
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
@@ -100,20 +99,14 @@ class CSCITrainer:
         """
         Train only the CrossSpectralEstimator (S matrix) using L_spectral.
         No forecaster forward pass needed — only FFT → Wiener → spectral loss.
-        Uses all nodes as observed with random masking for each batch.
-
-        Args:
-            input: [B, in_dim, N, T] full (unmasked) input
-        Returns:
-            spectral_loss: scalar
         """
         # Freeze everything except cs_estimator
-        for p in self.csci.parameters():
+        for p in self.cvfa.parameters():
             p.requires_grad = False
-        for p in self.csci.cs_estimator.parameters():
+        for p in self.cvfa.cs_estimator.parameters():
             p.requires_grad = True
 
-        self.csci.cs_estimator.train()
+        self.cvfa.cs_estimator.train()
         self.s_optimizer.zero_grad()
 
         B, _, N, T = input.shape
@@ -131,21 +124,21 @@ class CSCITrainer:
         V_miss_true = V_all[:, :, miss_idx]  # [B, F, M]
 
         # Wiener filter estimation
-        V_miss_hat, sigma = self.csci.cs_estimator(V_obs, obs_idx, miss_idx)
+        V_miss_hat, _sigma = self.cvfa.cs_estimator(V_obs, obs_idx, miss_idx)
 
         # Spectral alignment loss only
         loss = self.criterion.spectral_alignment_loss(V_miss_hat, V_miss_true)
 
         loss.backward()
         if self.clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.csci.cs_estimator.parameters(), self.clip)
+            torch.nn.utils.clip_grad_norm_(self.cvfa.cs_estimator.parameters(), self.clip)
         self.s_optimizer.step()
 
         return loss.item()
 
     def eval_S_only(self, args, input):
         """Evaluate S-only spectral loss (no grad)."""
-        self.csci.cs_estimator.eval()
+        self.cvfa.cs_estimator.eval()
 
         with torch.no_grad():
             B, _, N, T = input.shape
@@ -160,41 +153,31 @@ class CSCITrainer:
             V_obs = V_all[:, :, obs_idx]
             V_miss_true = V_all[:, :, miss_idx]
 
-            V_miss_hat, sigma = self.csci.cs_estimator(V_obs, obs_idx, miss_idx)
+            V_miss_hat, _sigma = self.cvfa.cs_estimator(V_obs, obs_idx, miss_idx)
             loss = self.criterion.spectral_alignment_loss(V_miss_hat, V_miss_true)
 
         return loss.item()
 
-    # ─── Stage 2: CSCI Training (Forecaster Frozen) ───
+    # ─── Stage 2: CVFA Training (Forecaster Fully Frozen) ───
 
-    def train_csci(self, args, input, real_val, obs_idx, miss_idx, input_unmasked=None):
+    def train_cvfa(self, args, input, real_val, obs_idx, miss_idx, input_unmasked=None):
         """
-        Train CSCI modules with forecaster frozen.
-
-        Args:
-            input: [B, in_dim, N, T] masked input (unobserved zeroed)
-            real_val: [B, N, T] ground truth future values
-            obs_idx: [K] observed variable indices
-            miss_idx: [M] missing variable indices
-            input_unmasked: [B, in_dim, N, T] original unmasked input (for spectral GT & tod bypass)
+        Train CVFA modules with forecaster fully frozen.
+        No backbone modification — CVFA outputs [B, in_dim, N, T] directly.
         """
-        # Freeze forecaster (except input layers — start_conv/skip0 are trainable)
-        for name, p in self.forecaster.named_parameters():
-            if 'start_conv' in name or 'skip0' in name:
-                p.requires_grad = True
-            else:
-                p.requires_grad = False
+        # Freeze forecaster entirely (no input layer replacement)
+        for p in self.forecaster.parameters():
+            p.requires_grad = False
+        self.forecaster.eval()  # dropout/batchnorm 비활성화
 
-        self.csci.train()
-        self.forecaster.start_conv.train()
-        self.forecaster.skip0.train()
-        self.csci_optimizer.zero_grad()
+        self.cvfa.train()
+        self.cvfa_optimizer.zero_grad()
 
-        # Forward through CSCI → ForecastHead → forecaster-ready input
-        fc_input, attn_bias, V_miss_hat, sigma = self.csci(
+        # Forward through CVFA → iFFT → forecaster-ready input
+        fc_input, V_miss_hat = self.cvfa(
             input, obs_idx, miss_idx, x_full_unmasked=input_unmasked
         )
-        # fc_input: [B, csci_in_dim, N, T] — d_model(+extra) channels
+        # fc_input: [B, in_dim, N, T] — same channel dim as original backbone
 
         # Forecaster prediction
         output = self.forecaster(fc_input, idx=torch.arange(args.num_nodes).to(self.device), args=args)
@@ -213,31 +196,26 @@ class CSCITrainer:
         else:
             V_miss_true = None
 
-        # Compute combined loss
+        # Compute combined loss (2-term)
         total_loss, loss_dict = self.criterion(
-            predict, real, V_miss_hat, V_miss_true, sigma
+            predict, real, V_miss_hat, V_miss_true
         )
 
         total_loss.backward()
         if self.clip is not None:
-            # Clip both CSCI and trainable forecaster input layers
-            trainable_params = list(self.csci.parameters()) + \
-                list(self.forecaster.start_conv.parameters()) + \
-                list(self.forecaster.skip0.parameters())
-            torch.nn.utils.clip_grad_norm_(trainable_params, self.clip)
-        self.csci_optimizer.step()
+            torch.nn.utils.clip_grad_norm_(self.cvfa.parameters(), self.clip)
+        self.cvfa_optimizer.step()
 
         rmse = masked_rmse(predict, real, 0.0)[0].item()
-        self.iter += 1
         return total_loss.item(), rmse, loss_dict
 
-    def eval_csci(self, args, input, real_val, obs_idx, miss_idx, input_unmasked=None):
-        """Evaluate CSCI + Forecaster."""
-        self.csci.eval()
+    def eval_cvfa(self, args, input, real_val, obs_idx, miss_idx, input_unmasked=None):
+        """Evaluate CVFA + Forecaster."""
+        self.cvfa.eval()
         self.forecaster.eval()
 
         with torch.no_grad():
-            fc_input, attn_bias, V_miss_hat, sigma = self.csci(
+            fc_input, V_miss_hat = self.cvfa(
                 input, obs_idx, miss_idx, x_full_unmasked=input_unmasked
             )
 
@@ -257,7 +235,7 @@ class CSCITrainer:
                 V_miss_true = None
 
             total_loss, loss_dict = self.criterion(
-                predict, real, V_miss_hat, V_miss_true, sigma
+                predict, real, V_miss_hat, V_miss_true
             )
             rmse = masked_rmse(predict, real, 0.0)[0].item()
 
