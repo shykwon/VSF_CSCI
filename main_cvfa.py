@@ -101,6 +101,14 @@ def build_args():
     parser.add_argument('--alpha_loss', type=float, default=0.7, help='Forecast loss weight')
     parser.add_argument('--beta_loss', type=float, default=0.3, help='Spectral alignment loss weight')
 
+    # ── Loss: obs-only forecast + consistency ──
+    parser.add_argument('--obs_only_loss', type=str_to_bool, default=True,
+                        help='Compute forecast loss on observed variables only')
+    parser.add_argument('--gamma_loss', type=float, default=0.1,
+                        help='Consistency loss weight (0=disabled)')
+    parser.add_argument('--s_train_obs_ratio', type=float, default=0.5,
+                        help='Observation ratio for Stage 1.5 S-matrix training')
+
     # ── VSF Evaluation (VIDA protocol) ──
     parser.add_argument('--runs', type=int, default=10, help='Number of model training runs (10 for mean±std)')
     parser.add_argument('--random_node_idx_split_runs', type=int, default=100)

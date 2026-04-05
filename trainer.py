@@ -112,8 +112,9 @@ class CVFATrainer:
         B, _, N, T = input.shape
         x_signal = input[:, 0, :, :]  # [B, N, T]
 
-        # Random masking: select ~50% as observed
-        n_obs = max(N // 2, 1)
+        # Random masking: select observed ratio (default 50%, configurable via --s_train_obs_ratio)
+        s_obs_ratio = getattr(args, 's_train_obs_ratio', 0.5)
+        n_obs = max(int(N * s_obs_ratio), 1)
         perm = torch.randperm(N, device=input.device)
         obs_idx = perm[:n_obs].sort().values
         miss_idx = perm[n_obs:].sort().values
@@ -144,7 +145,8 @@ class CVFATrainer:
             B, _, N, T = input.shape
             x_signal = input[:, 0, :, :]
 
-            n_obs = max(N // 2, 1)
+            s_obs_ratio = getattr(args, 's_train_obs_ratio', 0.5)
+            n_obs = max(int(N * s_obs_ratio), 1)
             perm = torch.randperm(N, device=input.device)
             obs_idx = perm[:n_obs].sort().values
             miss_idx = perm[n_obs:].sort().values
@@ -173,6 +175,8 @@ class CVFATrainer:
         self.cvfa.train()
         self.cvfa_optimizer.zero_grad()
 
+        all_idx = torch.arange(args.num_nodes).to(self.device)
+
         # Forward through CVFA → iFFT → forecaster-ready input
         fc_input, V_miss_hat = self.cvfa(
             input, obs_idx, miss_idx, x_full_unmasked=input_unmasked
@@ -180,11 +184,19 @@ class CVFATrainer:
         # fc_input: [B, in_dim, N, T] — same channel dim as original backbone
 
         # Forecaster prediction
-        output = self.forecaster(fc_input, idx=torch.arange(args.num_nodes).to(self.device), args=args)
+        output = self.forecaster(fc_input, idx=all_idx, args=args)
         output = output.transpose(1, 3)
         predict = self.scaler.inverse_transform(output)
 
         real = torch.unsqueeze(real_val, dim=1)
+
+        # Obs-only forecast loss
+        if getattr(args, 'obs_only_loss', False):
+            predict_for_loss = predict[:, :, obs_idx, :]
+            real_for_loss = real[:, :, obs_idx, :]
+        else:
+            predict_for_loss = predict
+            real_for_loss = real
 
         # Ground truth spectra for spectral loss (from UNMASKED input)
         gt_source = input_unmasked if input_unmasked is not None else input
@@ -198,8 +210,19 @@ class CVFATrainer:
 
         # Compute combined loss (2-term)
         total_loss, loss_dict = self.criterion(
-            predict, real, V_miss_hat, V_miss_true
+            predict_for_loss, real_for_loss, V_miss_hat, V_miss_true
         )
+
+        # Consistency loss: CVFA input → backbone vs full input → backbone
+        gamma = getattr(args, 'gamma_loss', 0.0)
+        if gamma > 0 and input_unmasked is not None:
+            with torch.no_grad():
+                full_output = self.forecaster(input_unmasked, idx=all_idx, args=args)
+                full_output = full_output.transpose(1, 3)
+                full_predict = self.scaler.inverse_transform(full_output)
+            L_consist, _ = masked_mae(predict, full_predict, 0.0)
+            total_loss = total_loss + gamma * L_consist
+            loss_dict['consistency'] = L_consist.item()
 
         total_loss.backward()
         if self.clip is not None:
@@ -225,6 +248,14 @@ class CVFATrainer:
 
             real = torch.unsqueeze(real_val, dim=1)
 
+            # Obs-only forecast loss
+            if getattr(args, 'obs_only_loss', False):
+                predict_for_loss = predict[:, :, obs_idx, :]
+                real_for_loss = real[:, :, obs_idx, :]
+            else:
+                predict_for_loss = predict
+                real_for_loss = real
+
             gt_source = input_unmasked if input_unmasked is not None else input
             M = miss_idx.shape[0]
             if M > 0:
@@ -235,7 +266,7 @@ class CVFATrainer:
                 V_miss_true = None
 
             total_loss, loss_dict = self.criterion(
-                predict, real, V_miss_hat, V_miss_true
+                predict_for_loss, real_for_loss, V_miss_hat, V_miss_true
             )
             rmse = masked_rmse(predict, real, 0.0)[0].item()
 
